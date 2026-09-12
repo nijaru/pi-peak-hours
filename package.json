@@ -1,6 +1,6 @@
 {
-  "name": "pi-peak-hours",
-  "version": "0.1.0",
+  "name": "@nijaru/pi-peak-hours",
+  "version": "0.0.1",
   "type": "module",
   "description": "Correct pi's recorded cost for providers that bill by time of day, with a peak multiplier in the footer status.",
   "keywords": [
@@ -14,6 +14,9 @@
     "deepseek"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Nick Naru <nick@nijaru.com>",
   "repository": {
     "type": "git",

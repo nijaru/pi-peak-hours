@@ -9,7 +9,7 @@ This extension rewrites `usage.cost` on the finalized assistant message, so the 
 ## Install
 
 ```bash
-pi install git:github.com/nijaru/pi-peak-hours
+pi install npm:@nijaru/pi-peak-hours
 ```
 
 Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine install.
