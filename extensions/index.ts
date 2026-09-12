@@ -282,7 +282,7 @@ export default function peakHours(pi: ExtensionAPI): void {
 			return;
 		}
 		const multiplier = multiplierAt(new Date(), schedule);
-		ctx.ui.setStatus(STATUS_KEY, multiplier > 1 ? STATUS_PEAK : undefined);
+		ctx.ui.setStatus(STATUS_KEY, multiplier > 1 ? `· ${STATUS_PEAK}` : undefined);
 	}
 
 	function notifyStatus(ctx: ExtensionContext): void {
