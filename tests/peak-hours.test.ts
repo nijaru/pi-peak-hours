@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
 	applyMultiplier,
 	DEFAULT_SCHEDULE,
+	describeRate,
 	isPeakAt,
 	matchesPattern,
 	matchesSchedule,
@@ -267,11 +268,15 @@ describe("schedule matching", () => {
 });
 
 describe("statusIndicator", () => {
-	const deepseek = { provider: "deepseek", id: "deepseek-flash" };
-	const other = { provider: "openai-codex", id: "gpt-6-astra" };
+	// pi's off-peak base for DeepSeek direct, as this user's models.json sets it.
+	const cost = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
+	const deepseek = { provider: "deepseek", id: "deepseek-flash", cost };
+	const other = { provider: "openai-codex", id: "gpt-6-astra", cost };
 
-	test("shows peak only for a covered model inside a peak window", () => {
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe(`· ${STATUS_PEAK}`);
+	test("quotes the rate in force, prefixed when it differs from the recorded one", () => {
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe(`· ${STATUS_PEAK} $0.3/$1.2/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe("· $0.15/$0.6/M");
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe("· $0.15/$0.6/M");
 	});
 
 	test("stays hidden for models no schedule covers", () => {
@@ -279,17 +284,17 @@ describe("statusIndicator", () => {
 		expect(statusIndicator([DEFAULT_SCHEDULE], true, undefined, weekday(2))).toBeUndefined();
 	});
 
-	test("stays hidden off-peak or when correction is off", () => {
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBeUndefined();
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBeUndefined();
+	test("stays hidden when correction is off or the model has no recorded cost", () => {
 		expect(statusIndicator([DEFAULT_SCHEDULE], false, deepseek, weekday(2))).toBeUndefined();
+		const free = { provider: "deepseek", id: "deepseek-flash", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, free, weekday(2))).toBeUndefined();
 	});
 
 	test("honors a provider-scoped override", () => {
 		const schedules = [resolveSchedule({ providers: ["openrouter"], models: ["deepseek/*"] })];
-		expect(statusIndicator(schedules, true, { provider: "openrouter", id: "deepseek/v4" }, weekday(2))).toBe(
-			`· ${STATUS_PEAK}`,
-		);
+		const routed = { provider: "openrouter", id: "deepseek/v4", cost };
+
+		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe(`· ${STATUS_PEAK} $0.3/$1.2/M`);
 		expect(statusIndicator(schedules, true, deepseek, weekday(2))).toBeUndefined();
 	});
 
@@ -297,12 +302,27 @@ describe("statusIndicator", () => {
 		const schedules = resolveSchedules({
 			schedules: [{ providers: ["zai"], windows: [["06:00", "10:00"]], multiplier: 1, outside: 0.5 }],
 		});
-		const zai = { provider: "zai", id: "glm-5.3" };
+		const zai = { provider: "zai", id: "glm-5.3", cost: { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 } };
 
-		// 07:00 UTC is the peak window, where the standard rate applies.
-		expect(statusIndicator(schedules, true, zai, weekday(7))).toBeUndefined();
-		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· ${STATUS_OFF_PEAK}`);
-		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· ${STATUS_OFF_PEAK}`);
+		// 07:00 UTC is the window where the standard rate applies, so the rate is the
+		// recorded one and only the price is shown.
+		expect(statusIndicator(schedules, true, zai, weekday(7))).toBe("· $1.4/$4.4/M");
+		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+	});
+});
+
+describe("describeRate", () => {
+	test("scales both directions and trims trailing zeros", () => {
+		const cost = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
+
+		expect(describeRate(cost, 1)).toBe("$0.15/$0.6/M");
+		expect(describeRate(cost, 2)).toBe("$0.3/$1.2/M");
+		expect(describeRate(cost, 0.5)).toBe("$0.075/$0.3/M");
+	});
+
+	test("is empty for a model with no recorded cost", () => {
+		expect(describeRate({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, 2)).toBe("");
 	});
 });
 

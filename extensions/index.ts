@@ -14,9 +14,12 @@
  * corrected number appears in the footer, the per-model breakdown, and the
  * HTML export without further plumbing.
  *
- * The footer indicator is scoped to the selected model: a session on a
- * provider or model the schedule does not cover never shows a rate, and
- * switching models re-evaluates it.
+ * The footer indicator is scoped to the selected model and quotes the rate that
+ * applies to it right now, in dollars per million tokens: `· ${STATUS_PEAK}
+ * $0.30/$1.20/M` at peak, `· $0.15/$0.60/M` off it. The rate is the one pi
+ * recorded scaled by the schedule, so it always agrees with the cost this
+ * extension writes. A session on a provider or model no schedule covers never
+ * shows a rate, and switching models re-evaluates it.
  *
  * Schedules are provider-scoped and there can be several, because the shape of
  * the correction differs: DeepSeek's list price is its off-peak rate, so peak is
@@ -67,6 +70,8 @@ export const STATUS_KEY = "peak-hours";
 export const STATUS_PEAK = "▲ peak";
 /** Shown when the rate in force is below the recorded one, e.g. an off-peak discount. */
 export const STATUS_OFF_PEAK = "▼ off-peak";
+/** Rates are quoted per million tokens, like every provider rate card. */
+export const RATE_UNIT = "/M";
 export const COMMAND_PEAK_HOURS = "peak-hours";
 export const CONFIG_BASENAME = "pi-peak-hours.json";
 export const CONFIG_PATH = join(getAgentDir(), "extensions", CONFIG_BASENAME);
@@ -288,6 +293,19 @@ export interface ModelKey {
 	id: string;
 }
 
+/** Per-million-token rates, in the shape pi records them. */
+export interface RateCard {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+/** A selected model with the rates pi would charge it at, which the schedule scales. */
+export interface ModelRate extends ModelKey {
+	cost: RateCard;
+}
+
 /** The first schedule covering a provider/model pair. */
 export function scheduleFor(schedules: Schedule[], provider: string, model: string): Schedule | undefined {
 	return schedules.find((schedule) => matchesSchedule(schedule, provider, model));
@@ -304,35 +322,49 @@ export function rateStateAt(when: Date, schedule: Schedule): RateState {
 }
 
 /**
- * The footer indicator for a selected model, or undefined when it should be
- * absent: correction disabled, no model selected, a model no schedule covers, or
- * a rate that already matches the billed one.
+ * The rate in force for a model, e.g. `$0.30/$1.20/M`. Empty when pi records no
+ * cost, which keeps free models and unpriced ones out of the footer.
+ */
+export function describeRate(cost: RateCard, multiplier: number): string {
+	if (![cost.input, cost.output, cost.cacheRead, cost.cacheWrite].some((rate) => rate > 0)) return "";
+	return `$${formatRate(cost.input * multiplier)}/$${formatRate(cost.output * multiplier)}${RATE_UNIT}`;
+}
+
+/** Up to three decimals, without trailing zeros: 1.200 -> 1.2, 0.150 -> 0.15. */
+function formatRate(value: number): string {
+	return value.toFixed(3).replace(/\.?0+$/, "");
+}
+
+/**
+ * The footer indicator for a selected model: the rate in force, prefixed with
+ * `peak` or `off-peak` when it differs from the rate pi recorded. Undefined when
+ * correction is disabled, no model is selected, no schedule covers it, or it has
+ * no recorded cost to report.
  */
 export function statusIndicator(
 	schedules: Schedule[],
 	active: boolean,
-	model: ModelKey | undefined,
+	model: ModelRate | undefined,
 	now: Date = new Date(),
 ): string | undefined {
 	if (!active || !model) return undefined;
 	const schedule = scheduleFor(schedules, model.provider, model.id);
 	if (!schedule) return undefined;
 
+	const rate = describeRate(model.cost, multiplierAt(now, schedule));
+	if (!rate) return undefined;
+
 	switch (rateStateAt(now, schedule)) {
 		case "peak":
-			return `· ${STATUS_PEAK}`;
+			return `· ${STATUS_PEAK} ${rate}`;
 		case "off-peak":
-			return `· ${STATUS_OFF_PEAK}`;
+			return `· ${STATUS_OFF_PEAK} ${rate}`;
 		default:
-			return undefined;
+			return `· ${rate}`;
 	}
 }
 
-export interface CostBreakdown {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
+export interface CostBreakdown extends RateCard {
 	total: number;
 }
 
@@ -421,11 +453,11 @@ export default function peakHours(pi: ExtensionAPI): void {
 		active = config.active ?? DEFAULT_ACTIVE;
 	}
 
-	function updateStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
+	function updateStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {
 		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedules, active, model));
 	}
 
-	function notifyStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
+	function notifyStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {
 		if (!active) {
 			ctx.ui.notify(`Peak hours: off.`, "info");
 			return;
@@ -442,13 +474,15 @@ export default function peakHours(pi: ExtensionAPI): void {
 			return;
 		}
 		const multiplier = multiplierAt(new Date(), schedule);
+		const rate = describeRate(model.cost, multiplier);
 		const state =
 			multiplier > 1
 				? `peak ×${multiplier} right now`
 				: multiplier < 1
 					? `off-peak ×${multiplier} right now`
 					: "no correction right now";
-		ctx.ui.notify(`Peak hours: ${state}. ${describeSchedule(schedule)}`, "info");
+		const detail = rate ? `${state} (${rate})` : state;
+		ctx.ui.notify(`Peak hours: ${detail}. ${describeSchedule(schedule)}`, "info");
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -463,6 +497,12 @@ export default function peakHours(pi: ExtensionAPI): void {
 
 	pi.on("model_select", async (event, ctx) => {
 		updateStatus(ctx, event.model);
+	});
+
+	// The window boundary can pass between messages, and the footer quotes a price
+	// that changes with it, so re-evaluate whenever a turn starts.
+	pi.on("turn_start", async (_event, ctx) => {
+		updateStatus(ctx);
 	});
 
 	pi.on("message_start", async (event) => {

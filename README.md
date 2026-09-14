@@ -4,7 +4,9 @@ Correct pi's recorded cost for providers that bill by time of day, and show the 
 
 DeepSeek is the current example. Its published prices are the **off-peak** rates, and a **2x** multiplier applies during peak windows — `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, with every other hour (including all weekend) off-peak. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session running during a peak window understates its cost by up to 2x.
 
-This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. While a corrected rate is in force **for the selected provider and model** the footer shows it: `▲ peak` when the hour costs more than the rate pi recorded, `▼ off-peak` when it costs less. `/peak-hours status` names the schedule and the rate in force.
+This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. The status line quotes the rate in force for the selected model — `· ▲ peak $0.30/$1.20/M` during a peak window, `· $0.15/$0.60/M` off it — with `▲ peak` or `▼ off-peak` added when the hour costs more or less than the rate pi recorded. `/peak-hours status` names the schedule behind it.
+
+The quoted rate is pi's recorded rate scaled by the schedule, so it always agrees with the cost written to the session. Where pi's rate table is stale or wrong for your route, the quoted rate is stale in the same way — the extension corrects the shape of the bill, not the base rate.
 
 ## Install
 
@@ -20,6 +22,8 @@ Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine 
 /peak-hours           # show the effective schedule and the current rate
 /peak-hours on|off    # toggle correction; persists to pi-peak-hours.json
 ```
+
+The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized, so a window boundary crossed mid-session is picked up by the next turn.
 
 ## Configuration
 
@@ -84,7 +88,7 @@ A malformed field falls back to its default rather than disabling the extension;
 
 ## Design notes
 
-- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day; switching models re-evaluates it. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak.
+- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak. The quoted rate and the written cost come from the same multiplication, so they cannot disagree.
 - **Rate by request start.** DeepSeek bills by arrival time, so the multiplier is chosen from the `message_start` timestamp rather than `message_end`. A request spanning a window boundary would otherwise land on the wrong side.
 - **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.
