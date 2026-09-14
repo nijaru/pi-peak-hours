@@ -106,7 +106,7 @@ A malformed field falls back to its default rather than disabling the extension;
 
 ## Stack
 
-TypeScript, Bun. Pi extension API (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`). No build step — pi loads the extension directly.
+TypeScript, Bun. Pi extension API (`@earendil-works/pi-coding-agent`). `@earendil-works/pi-ai` is a dev dependency only — the handlers use pi's own `Model` and usage shapes structurally, so nothing from it ships. No build step — pi loads the extension directly.
 
 ## Testing
 
