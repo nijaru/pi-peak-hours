@@ -22,4 +22,11 @@ jobs:
           package-manager-cache: false
       - run: bun install --frozen-lockfile
       - run: bun run check
+      # Trusted publishing: npm accepts this workflow's OIDC identity only once
+      # the package has a matching trusted publisher. Without it the PUT returns
+      # 404 "you do not have permission to access it", after provenance has
+      # already been signed. Configure or inspect it with:
+      #   npm trust github @nijaru/pi-peak-hours --file publish.yml \
+      #     --repo nijaru/pi-peak-hours --allow-publish
+      #   npm trust list @nijaru/pi-peak-hours
       - run: npm publish --provenance
