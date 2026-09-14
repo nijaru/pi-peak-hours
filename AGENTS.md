@@ -19,7 +19,8 @@ No build step — pi loads the extension directly.
 ## Invariants
 
 - Rate selection uses the request start time from `message_start`, never `message_end`, because the provider bills by arrival.
-- A message is scaled at most once; retries re-deliver the same object.
+- A message is scaled at most once, including the replacement returned to pi; retries re-deliver the same object.
+- The footer quotes the rate in force (input/output per million tokens) and names the direction: `▲ peak` above the recorded rate, `▼ off-peak` below it.
 - Only the four cost fields change and `total` is recomputed from them. Token counts are never modified.
 - Malformed configuration falls back to defaults; the extension never throws inside a message handler.
 
@@ -31,5 +32,5 @@ Merge only a coherent, independently usable slice: it must be complete as a user
 
 ```
 extensions/index.ts   # schedule parsing, peak detection, cost correction, command
-tests/                # schedule, boundary, wrapping-window, and config tests
+tests/                # schedule, boundary, wrapping-window, config, and handler tests
 ```

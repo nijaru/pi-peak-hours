@@ -1,12 +1,12 @@
 /**
  * pi-peak-hours — correct recorded cost for providers that bill by time of day.
  *
- * DeepSeek is the clearest example: its published prices are the off-peak
- * rates, and a 2x multiplier applies during peak windows (01:00-04:00 and
- * 06:00-10:00 UTC, Monday-Friday, as of September 2026). pi has no notion of
- * time-of-day pricing — `usage.cost` is computed once from the model's flat
- * rates when usage is finalized — so the footer understates such sessions by
- * up to 2x while a peak window is open.
+ * DeepSeek is the clearest example: a 2x multiplier applies during peak windows
+ * (01:00-04:00 and 06:00-10:00 UTC, Monday-Friday, as of September 2026) and the
+ * off-peak rate is half of it. pi has no notion of time-of-day pricing —
+ * `usage.cost` is computed once from the model's flat rates when usage is
+ * finalized — so a session is over- or understated by up to 2x, in whichever
+ * direction the recorded rate sits from the billed one.
  *
  * This extension rewrites `usage.cost` on the finalized assistant message in
  * `message_end`, the documented hook for replacing a message. The footer
@@ -15,7 +15,7 @@
  * HTML export without further plumbing.
  *
  * The footer indicator is scoped to the selected model and quotes the rate that
- * applies to it right now, in dollars per million tokens: `· ${STATUS_PEAK}
+ * applies to it right now, in dollars per million tokens: `· ▲ peak
  * $0.30/$1.20/M` at peak, `· $0.15/$0.60/M` off it. The rate is the one pi
  * recorded scaled by the schedule, so it always agrees with the cost this
  * extension writes. A session on a provider or model no schedule covers never
@@ -57,7 +57,6 @@
  */
 
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -128,6 +127,26 @@ export const DEFAULT_SCHEDULE: Schedule = {
 	providers: ["deepseek"],
 	models: ["*"],
 };
+
+/**
+ * The same model resold by OpenRouter, which pi's catalog rates at the off-peak
+ * price while its own `deepseek` provider is rated at peak. Without this the
+ * route silently keeps pi's flat rate.
+ */
+export const OPENROUTER_SCHEDULE: Schedule = {
+	multiplier: 2,
+	outside: 1,
+	windows: [
+		{ start: 60, end: 240 },
+		{ start: 360, end: 600 },
+	],
+	days: [1, 2, 3, 4, 5],
+	providers: ["openrouter"],
+	models: ["deepseek/*"],
+};
+
+/** What a config that says nothing about schedules resolves to. */
+export const DEFAULT_SCHEDULES: Schedule[] = [DEFAULT_SCHEDULE, OPENROUTER_SCHEDULE];
 
 /**
  * Base for schedules listed explicitly in `schedules`: no windows, no
@@ -210,43 +229,36 @@ function parseStringList(value: unknown): string[] | undefined {
 
 /** Overlay a parsed config onto `base`. Invalid fields keep the base value. */
 export function resolveSchedule(config: ScheduleConfig, base: Schedule = DEFAULT_SCHEDULE): Schedule {
-	const schedule: Schedule = {
-		multiplier: base.multiplier,
-		outside: base.outside,
-		windows: base.windows,
-		days: base.days,
-		providers: base.providers,
-		models: base.models,
+	return {
+		multiplier: parseMultiplier(config.multiplier) ?? base.multiplier,
+		outside: parseMultiplier(config.outside) ?? base.outside,
+		// Copied, so a resolved schedule never aliases an exported default.
+		windows: parseWindows(config.windows) ?? base.windows.map((window) => ({ ...window })),
+		days: parseDays(config.days) ?? [...base.days],
+		providers: parseStringList(config.providers) ?? [...base.providers],
+		models: parseStringList(config.models) ?? [...base.models],
 	};
+}
 
-	const multiplier = parseMultiplier(config.multiplier);
-	if (multiplier !== undefined) schedule.multiplier = multiplier;
-	const outside = parseMultiplier(config.outside);
-	if (outside !== undefined) schedule.outside = outside;
-	const windows = parseWindows(config.windows);
-	if (windows) schedule.windows = windows;
-	if (Array.isArray(config.days)) {
-		const days = config.days.map(parseDay);
-		if (days.every((day): day is number => day !== undefined)) schedule.days = days;
-	}
-	const providers = parseStringList(config.providers);
-	if (providers) schedule.providers = providers;
-	const models = parseStringList(config.models);
-	if (models) schedule.models = models;
-
-	return schedule;
+/** Day names or numbers, or undefined when the list is absent or partly invalid. */
+function parseDays(value: unknown): number[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const days = value.map(parseDay);
+	return days.every((day): day is number => day !== undefined) ? days : undefined;
 }
 
 /**
  * Every schedule the config describes. An explicit `schedules` list replaces the
- * built-in DeepSeek schedule; anything else overlays it.
+ * built-in schedules; a flat config overlays the DeepSeek one and drops the
+ * built-in OpenRouter route once it names its own providers.
  */
 export function resolveSchedules(config: ConfigFile): Schedule[] {
 	if (Array.isArray(config.schedules)) {
 		const entries = config.schedules.filter(isRecord).map((entry) => resolveSchedule(entry, NEUTRAL_SCHEDULE));
 		if (entries.length > 0) return entries;
 	}
-	return [resolveSchedule(config)];
+	const schedule = resolveSchedule(config);
+	return config.providers === undefined ? [schedule, OPENROUTER_SCHEDULE] : [schedule];
 }
 
 /** Whether a window covers the given instant, including windows that wrap midnight. */
@@ -322,17 +334,24 @@ export function rateStateAt(when: Date, schedule: Schedule): RateState {
 }
 
 /**
- * The rate in force for a model, e.g. `$0.30/$1.20/M`. Empty when pi records no
- * cost, which keeps free models and unpriced ones out of the footer.
+ * The rate in force for a model, e.g. `$0.30/$1.20/M`. Empty when the rate in
+ * force is free, which keeps free models out of the footer instead of printing a
+ * zero rate.
  */
 export function describeRate(cost: RateCard, multiplier: number): string {
-	if (![cost.input, cost.output, cost.cacheRead, cost.cacheWrite].some((rate) => rate > 0)) return "";
-	return `$${formatRate(cost.input * multiplier)}/$${formatRate(cost.output * multiplier)}${RATE_UNIT}`;
+	const input = cost.input * multiplier;
+	const output = cost.output * multiplier;
+	if (input <= 0 && output <= 0) return "";
+	return `$${formatRate(input)}/$${formatRate(output)}${RATE_UNIT}`;
 }
 
-/** Up to three decimals, without trailing zeros: 1.200 -> 1.2, 0.150 -> 0.15. */
+/** Up to three decimals without trailing zeros, and finer for a smaller rate. */
 function formatRate(value: number): string {
-	return value.toFixed(3).replace(/\.?0+$/, "");
+	for (const decimals of [3, 6]) {
+		const text = value.toFixed(decimals).replace(/\.?0+$/, "");
+		if (text !== "" && text !== "0") return text;
+	}
+	return "0";
 }
 
 /**
@@ -439,16 +458,37 @@ function describeAll(schedules: Schedule[]): string {
 	return configured.map(describeSchedule).join(" | ");
 }
 
-export default function peakHours(pi: ExtensionAPI): void {
-	let config = readConfig(CONFIG_PATH) ?? {};
+export interface PeakHoursOptions {
+	/** Config file to read; defaults to the one in pi's agent directory. */
+	configPath?: string;
+}
+
+/**
+ * Messages already scaled. Retries re-deliver the same object, and pi applies a
+ * returned replacement by copying it onto that same object in place, so object
+ * identity is what identifies a message here.
+ *
+ * Shared across extension instances through a global: with the npm package and a
+ * local checkout both loaded, each would otherwise keep its own set and scale
+ * every message twice.
+ */
+const ADJUSTED_KEY = Symbol.for("pi-peak-hours.adjusted");
+function adjustedMessages(): WeakSet<object> {
+	const registry = globalThis as unknown as Record<symbol, WeakSet<object> | undefined>;
+	registry[ADJUSTED_KEY] ??= new WeakSet<object>();
+	return registry[ADJUSTED_KEY];
+}
+
+export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = {}): void {
+	const configPath = options.configPath ?? CONFIG_PATH;
+	let config = readConfig(configPath) ?? {};
 	let schedules = resolveSchedules(config);
 	let active = config.active ?? DEFAULT_ACTIVE;
-	/** Messages already scaled; retries can re-deliver the same object. */
-	const adjusted = new WeakSet<AssistantMessage>();
+	const adjusted = adjustedMessages();
 	let pendingStart: number | undefined;
 
 	function refresh(): void {
-		config = readConfig(CONFIG_PATH) ?? {};
+		config = readConfig(configPath) ?? {};
 		schedules = resolveSchedules(config);
 		active = config.active ?? DEFAULT_ACTIVE;
 	}
@@ -538,15 +578,18 @@ export default function peakHours(pi: ExtensionAPI): void {
 
 		adjusted.add(message);
 		updateStatus(ctx);
-		return {
-			message: {
-				...message,
-				usage: {
-					...message.usage,
-					cost: applyMultiplier(message.usage.cost, multiplier),
-				},
+		const replacement = {
+			...message,
+			usage: {
+				...message.usage,
+				cost: applyMultiplier(message.usage.cost, multiplier),
 			},
 		};
+		// pi copies this onto the original, so the original's identity already
+		// carries the guard; registering the replacement covers a caller that
+		// replays the returned value instead.
+		adjusted.add(replacement);
+		return { message: replacement };
 	});
 
 	pi.registerCommand(COMMAND_PEAK_HOURS, {
@@ -568,7 +611,7 @@ export default function peakHours(pi: ExtensionAPI): void {
 				ctx.ui.notify("Usage: /peak-hours [on|off|status]", "error");
 				return;
 			}
-			writeActive(CONFIG_PATH, arg === "on");
+			writeActive(configPath, arg === "on");
 			refresh();
 			updateStatus(ctx);
 			notifyStatus(ctx);

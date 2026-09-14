@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
 	applyMultiplier,
 	DEFAULT_SCHEDULE,
+	DEFAULT_SCHEDULES,
 	describeRate,
 	isPeakAt,
 	matchesPattern,
@@ -109,8 +110,9 @@ describe("resolveSchedule", () => {
 });
 
 describe("resolveSchedules", () => {
-	test("defaults to the single DeepSeek schedule", () => {
-		expect(resolveSchedules({})).toEqual([DEFAULT_SCHEDULE]);
+	test("defaults to DeepSeek direct plus the OpenRouter route for it", () => {
+		expect(resolveSchedules({})).toEqual(DEFAULT_SCHEDULES);
+		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4.1-flash")).toBeDefined();
 	});
 
 	test("an explicit list replaces the default and does not inherit it", () => {
@@ -123,9 +125,26 @@ describe("resolveSchedules", () => {
 		expect(zai?.windows).toEqual([]);
 	});
 
+	test("a flat config that names providers drops the built-in OpenRouter route", () => {
+		const schedules = resolveSchedules({ providers: ["deepseek"], multiplier: 3 });
+
+		expect(schedules).toHaveLength(1);
+		expect(schedules[0]?.multiplier).toBe(3);
+		expect(scheduleFor(schedules, "openrouter", "deepseek/deepseek-v4.1-flash")).toBeUndefined();
+	});
+
 	test("an empty or malformed list falls back to the flat config", () => {
-		expect(resolveSchedules({ schedules: [] })).toEqual([DEFAULT_SCHEDULE]);
-		expect(resolveSchedules({ schedules: ["nope"] as never })).toEqual([DEFAULT_SCHEDULE]);
+		expect(resolveSchedules({ schedules: [] })).toEqual(DEFAULT_SCHEDULES);
+		expect(resolveSchedules({ schedules: ["nope"] as never })).toEqual(DEFAULT_SCHEDULES);
+	});
+
+	test("a resolved schedule does not alias the exported defaults", () => {
+		const schedule = resolveSchedule({});
+		schedule.windows.push({ start: 0, end: 1 });
+		schedule.providers.push("injected");
+
+		expect(DEFAULT_SCHEDULE.windows).toHaveLength(2);
+		expect(DEFAULT_SCHEDULE.providers).toEqual(["deepseek"]);
 	});
 
 	test("selects the first schedule covering a provider and model", () => {
@@ -319,6 +338,12 @@ describe("describeRate", () => {
 		expect(describeRate(cost, 1)).toBe("$0.15/$0.6/M");
 		expect(describeRate(cost, 2)).toBe("$0.3/$1.2/M");
 		expect(describeRate(cost, 0.5)).toBe("$0.075/$0.3/M");
+	});
+
+	test("keeps precision on rates below a tenth of a cent", () => {
+		const cost = { input: 0.0004, output: 0.00002, cacheRead: 0, cacheWrite: 0 };
+
+		expect(describeRate(cost, 1)).toBe("$0.0004/$0.00002/M");
 	});
 
 	test("is empty for a model with no recorded cost", () => {
