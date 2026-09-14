@@ -4,7 +4,7 @@ Correct pi's recorded cost for providers that bill by time of day, and show the 
 
 DeepSeek is the current example. Its published prices are the **off-peak** rates, and a **2x** multiplier applies during peak windows — `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, with every other hour (including all weekend) off-peak. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session running during a peak window understates its cost by up to 2x.
 
-This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. While peak is in force the status shows `▲ peak`; off-peak it clears. The indicator stays generic because the multiplier differs per service — `/peak-hours status` names the schedule and the rate in force.
+This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. While peak is in force **for the selected provider and model** the status shows `▲ peak`; off-peak, on an uncovered model, or with correction off it clears. The indicator stays generic because the multiplier differs per service — `/peak-hours status` names the schedule, the rate in force, and whether the current model is covered.
 
 ## Install
 
@@ -42,6 +42,7 @@ A malformed field falls back to its default rather than disabling the extension;
 
 ## Design notes
 
+- **Only the selected model drives the indicator.** The schedule is provider- and model-scoped, so the footer never shows `peak` for a service that does not bill by time of day; switching models re-evaluates it.
 - **Rate by request start.** DeepSeek bills by arrival time, so the multiplier is chosen from the `message_start` timestamp rather than `message_end`. A request spanning a window boundary would otherwise land on the wrong side.
 - **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.

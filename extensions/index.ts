@@ -14,6 +14,10 @@
  * corrected number appears in the footer, the per-model breakdown, and the
  * HTML export without further plumbing.
  *
+ * The footer indicator is scoped to the selected model: a session on a
+ * provider or model the schedule does not cover never shows `peak`, and
+ * switching models re-evaluates it.
+ *
  * Design constraints:
  *
  * - The rate is chosen from the request's START time, not its end. DeepSeek
@@ -56,6 +60,12 @@ export const CONFIG_PATH = join(getAgentDir(), "extensions", CONFIG_BASENAME);
 export interface ClockWindow {
 	start: number;
 	end: number;
+}
+
+/** The provider/model pair a request belongs to, as pi reports it. */
+export interface ModelKey {
+	provider: string;
+	id: string;
 }
 
 export interface Schedule {
@@ -195,6 +205,21 @@ export function matchesSchedule(schedule: Schedule, provider: string, model: str
 	);
 }
 
+/**
+ * The footer indicator for a selected model, or undefined when it should be
+ * absent: correction disabled, no model selected, a model the schedule does not
+ * cover, or an off-peak clock.
+ */
+export function statusIndicator(
+	schedule: Schedule,
+	active: boolean,
+	model: ModelKey | undefined,
+	now: Date = new Date(),
+): string | undefined {
+	if (!active || !model || !matchesSchedule(schedule, model.provider, model.id)) return undefined;
+	return multiplierAt(now, schedule) > 1 ? `· ${STATUS_PEAK}` : undefined;
+}
+
 export interface CostBreakdown {
 	input: number;
 	output: number;
@@ -276,18 +301,23 @@ export default function peakHours(pi: ExtensionAPI): void {
 		active = config.active ?? DEFAULT_ACTIVE;
 	}
 
-	function updateStatus(ctx: ExtensionContext): void {
-		if (!active) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			return;
-		}
-		const multiplier = multiplierAt(new Date(), schedule);
-		ctx.ui.setStatus(STATUS_KEY, multiplier > 1 ? `· ${STATUS_PEAK}` : undefined);
+	function updateStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
+		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedule, active, model));
 	}
 
-	function notifyStatus(ctx: ExtensionContext): void {
+	function notifyStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
 		if (!active) {
 			ctx.ui.notify(`Peak hours: off.`, "info");
+			return;
+		}
+		// The schedule is provider-scoped, so name why nothing applies to a model it
+		// does not cover instead of reporting a rate that will never be charged.
+		if (!model) {
+			ctx.ui.notify(`Peak hours: no model selected. ${describeSchedule(schedule)}`, "info");
+			return;
+		}
+		if (!matchesSchedule(schedule, model.provider, model.id)) {
+			ctx.ui.notify(`Peak hours: not applied to ${model.provider}/${model.id}. ${describeSchedule(schedule)}`, "info");
 			return;
 		}
 		const now = new Date();
@@ -306,8 +336,8 @@ export default function peakHours(pi: ExtensionAPI): void {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 
-	pi.on("model_select", async (_event, ctx) => {
-		updateStatus(ctx);
+	pi.on("model_select", async (event, ctx) => {
+		updateStatus(ctx, event.model);
 	});
 
 	pi.on("message_start", async (event) => {

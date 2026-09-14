@@ -14,6 +14,8 @@ import {
 	parseDay,
 	readConfig,
 	resolveSchedule,
+	STATUS_PEAK,
+	statusIndicator,
 	writeActive,
 } from "../extensions/index.ts";
 
@@ -139,6 +141,34 @@ describe("schedule matching", () => {
 	test("requires both provider and model to match", () => {
 		expect(matchesSchedule(DEFAULT_SCHEDULE, "deepseek", "deepseek-flash")).toBe(true);
 		expect(matchesSchedule(DEFAULT_SCHEDULE, "openrouter", "deepseek/deepseek-v4.1-flash")).toBe(false);
+	});
+});
+
+describe("statusIndicator", () => {
+	const deepseek = { provider: "deepseek", id: "deepseek-flash" };
+	const other = { provider: "openai-codex", id: "gpt-6-astra" };
+
+	test("shows peak only for a covered model inside a peak window", () => {
+		expect(statusIndicator(DEFAULT_SCHEDULE, true, deepseek, weekday(2))).toBe(`· ${STATUS_PEAK}`);
+	});
+
+	test("stays hidden for models the schedule does not cover", () => {
+		expect(statusIndicator(DEFAULT_SCHEDULE, true, other, weekday(2))).toBeUndefined();
+		expect(statusIndicator(DEFAULT_SCHEDULE, true, undefined, weekday(2))).toBeUndefined();
+	});
+
+	test("stays hidden off-peak or when correction is off", () => {
+		expect(statusIndicator(DEFAULT_SCHEDULE, true, deepseek, weekday(5))).toBeUndefined();
+		expect(statusIndicator(DEFAULT_SCHEDULE, true, deepseek, saturday(2))).toBeUndefined();
+		expect(statusIndicator(DEFAULT_SCHEDULE, false, deepseek, weekday(2))).toBeUndefined();
+	});
+
+	test("honors a provider-scoped override", () => {
+		const schedule = resolveSchedule({ providers: ["openrouter"], models: ["deepseek/*"] });
+		expect(statusIndicator(schedule, true, { provider: "openrouter", id: "deepseek/v4" }, weekday(2))).toBe(
+			`· ${STATUS_PEAK}`,
+		);
+		expect(statusIndicator(schedule, true, deepseek, weekday(2))).toBeUndefined();
 	});
 });
 
