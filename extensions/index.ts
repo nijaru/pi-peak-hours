@@ -15,8 +15,15 @@
  * HTML export without further plumbing.
  *
  * The footer indicator is scoped to the selected model: a session on a
- * provider or model the schedule does not cover never shows `peak`, and
+ * provider or model the schedule does not cover never shows a rate, and
  * switching models re-evaluates it.
+ *
+ * Schedules are provider-scoped and there can be several, because the shape of
+ * the correction differs: DeepSeek's list price is its off-peak rate, so peak is
+ * a surcharge (×2), while Z.ai's coding plan and Alibaba's night discount are
+ * priced the other way round and land below the recorded rate. A multiplier
+ * above 1 reads as `peak`, below 1 as `off-peak`, and the footer names the
+ * direction so a discount is never reported as a peak.
  *
  * Design constraints:
  *
@@ -24,6 +31,12 @@
  *   bills by when a request arrives, so a request spanning a window boundary
  *   would otherwise be billed on the wrong side of it. `message_start` gives
  *   the start; `message_end` gives the end.
+ * - A schedule declares the multiplier INSIDE its windows and `outside` for
+ *   every other hour. Which side pi's recorded rate sits on is not assumed:
+ *   encode it in the config, and only the difference is applied. pi's own
+ *   catalog disagrees with itself here — it lists DeepSeek direct at peak rates
+ *   and the same model through OpenRouter at off-peak rates — so a schedule that
+ *   guesses would double-charge one of them.
  * - A message is never scaled twice. Retries and overflow recovery can deliver
  *   the same message object again, so adjustments are guarded by identity.
  * - Only the four cost fields are touched, and `total` is recomputed from
@@ -52,6 +65,8 @@ export const STATUS_KEY = "peak-hours";
  * `/peak-hours status`, which names the schedule and the rate in force.
  */
 export const STATUS_PEAK = "▲ peak";
+/** Shown when the rate in force is below the recorded one, e.g. an off-peak discount. */
+export const STATUS_OFF_PEAK = "▼ off-peak";
 export const COMMAND_PEAK_HOURS = "peak-hours";
 export const CONFIG_BASENAME = "pi-peak-hours.json";
 export const CONFIG_PATH = join(getAgentDir(), "extensions", CONFIG_BASENAME);
@@ -60,16 +75,17 @@ export const CONFIG_PATH = join(getAgentDir(), "extensions", CONFIG_BASENAME);
 export interface ClockWindow {
 	start: number;
 	end: number;
+	/** Overrides the schedule multiplier inside this window. */
+	multiplier?: number;
 }
 
-/** The provider/model pair a request belongs to, as pi reports it. */
-export interface ModelKey {
-	provider: string;
-	id: string;
-}
-
+/**
+ * The rate in force inside `windows` versus `outside` them. Either side may be
+ * the cheaper one: above 1 is a surcharge, below 1 a discount.
+ */
 export interface Schedule {
 	multiplier: number;
+	outside: number;
 	windows: ClockWindow[];
 	/** 0 = Sunday, matching Date#getUTCDay. */
 	days: number[];
@@ -77,13 +93,20 @@ export interface Schedule {
 	models: string[];
 }
 
-export interface ConfigFile {
-	active?: boolean;
+/** Everything a single schedule accepts. */
+export interface ScheduleConfig {
 	multiplier?: number;
-	windows?: [string, string][];
+	outside?: number;
+	windows?: (readonly [string, string] | { start: string; end: string; multiplier?: number })[];
 	days?: (string | number)[];
 	providers?: string[];
 	models?: string[];
+}
+
+export interface ConfigFile extends ScheduleConfig {
+	active?: boolean;
+	/** Provider-scoped schedules, each resolved on its own rather than over the DeepSeek default. */
+	schedules?: ScheduleConfig[];
 }
 
 export const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
@@ -91,12 +114,28 @@ export const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as co
 /** DeepSeek's published schedule: peak mornings on UTC weekdays, everything else off-peak. */
 export const DEFAULT_SCHEDULE: Schedule = {
 	multiplier: 2,
+	outside: 1,
 	windows: [
 		{ start: 60, end: 240 },
 		{ start: 360, end: 600 },
 	],
 	days: [1, 2, 3, 4, 5],
 	providers: ["deepseek"],
+	models: ["*"],
+};
+
+/**
+ * Base for schedules listed explicitly in `schedules`: no windows, no
+ * correction, every provider and model. An entry supplies its own shape rather
+ * than inheriting DeepSeek's, which would be a surprising default for a
+ * different service.
+ */
+export const NEUTRAL_SCHEDULE: Schedule = {
+	multiplier: 1,
+	outside: 1,
+	windows: [],
+	days: [0, 1, 2, 3, 4, 5, 6],
+	providers: ["*"],
 	models: ["*"],
 };
 
@@ -126,13 +165,36 @@ function parseWindows(value: unknown): ClockWindow[] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	const windows: ClockWindow[] = [];
 	for (const entry of value) {
-		if (!Array.isArray(entry) || entry.length !== 2) return undefined;
-		const start = parseClock(entry[0]);
-		const end = parseClock(entry[1]);
-		if (start === undefined || end === undefined || start === end) return undefined;
-		windows.push({ start, end });
+		let start: unknown;
+		let end: unknown;
+		let multiplier: unknown;
+		if (Array.isArray(entry) && entry.length === 2) {
+			[start, end] = entry;
+		} else if (isRecord(entry)) {
+			start = entry.start;
+			end = entry.end;
+			multiplier = entry.multiplier;
+		} else {
+			return undefined;
+		}
+		const startMinutes = parseClock(start);
+		const endMinutes = parseClock(end);
+		if (startMinutes === undefined || endMinutes === undefined || startMinutes === endMinutes) return undefined;
+		const window: ClockWindow = { start: startMinutes, end: endMinutes };
+		if (multiplier !== undefined) {
+			const parsed = parseMultiplier(multiplier);
+			if (parsed === undefined) return undefined;
+			window.multiplier = parsed;
+		}
+		windows.push(window);
 	}
 	return windows;
+}
+
+/** A positive finite multiplier: above 1 for a surcharge, below 1 for a discount. */
+export function parseMultiplier(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+	return value;
 }
 
 function parseStringList(value: unknown): string[] | undefined {
@@ -141,19 +203,21 @@ function parseStringList(value: unknown): string[] | undefined {
 	return items.length === value.length ? items.map((item) => item.trim()) : undefined;
 }
 
-/** Overlay a parsed config file onto the defaults. Invalid fields fall back to the default. */
-export function resolveSchedule(config: ConfigFile): Schedule {
+/** Overlay a parsed config onto `base`. Invalid fields keep the base value. */
+export function resolveSchedule(config: ScheduleConfig, base: Schedule = DEFAULT_SCHEDULE): Schedule {
 	const schedule: Schedule = {
-		multiplier: DEFAULT_SCHEDULE.multiplier,
-		windows: DEFAULT_SCHEDULE.windows,
-		days: DEFAULT_SCHEDULE.days,
-		providers: DEFAULT_SCHEDULE.providers,
-		models: DEFAULT_SCHEDULE.models,
+		multiplier: base.multiplier,
+		outside: base.outside,
+		windows: base.windows,
+		days: base.days,
+		providers: base.providers,
+		models: base.models,
 	};
 
-	if (typeof config.multiplier === "number" && Number.isFinite(config.multiplier) && config.multiplier >= 1) {
-		schedule.multiplier = config.multiplier;
-	}
+	const multiplier = parseMultiplier(config.multiplier);
+	if (multiplier !== undefined) schedule.multiplier = multiplier;
+	const outside = parseMultiplier(config.outside);
+	if (outside !== undefined) schedule.outside = outside;
 	const windows = parseWindows(config.windows);
 	if (windows) schedule.windows = windows;
 	if (Array.isArray(config.days)) {
@@ -168,27 +232,40 @@ export function resolveSchedule(config: ConfigFile): Schedule {
 	return schedule;
 }
 
-/** Whether a request that started at `startedAt` falls inside a peak window. */
-export function isPeakAt(startedAt: Date, schedule: Schedule): boolean {
+/**
+ * Every schedule the config describes. An explicit `schedules` list replaces the
+ * built-in DeepSeek schedule; anything else overlays it.
+ */
+export function resolveSchedules(config: ConfigFile): Schedule[] {
+	if (Array.isArray(config.schedules)) {
+		const entries = config.schedules.filter(isRecord).map((entry) => resolveSchedule(entry, NEUTRAL_SCHEDULE));
+		if (entries.length > 0) return entries;
+	}
+	return [resolveSchedule(config)];
+}
+
+/** Whether a window covers the given instant, including windows that wrap midnight. */
+function windowCovers(window: ClockWindow, startedAt: Date, days: number[]): boolean {
 	const minutes = startedAt.getUTCHours() * 60 + startedAt.getUTCMinutes();
 	const day = startedAt.getUTCDay();
 
-	for (const window of schedule.windows) {
-		if (window.end > window.start) {
-			if (schedule.days.includes(day) && minutes >= window.start && minutes < window.end) return true;
-			continue;
-		}
-		// A window that runs past midnight started on the previous UTC day.
-		const previous = (day + 6) % 7;
-		if (schedule.days.includes(day) && minutes >= window.start) return true;
-		if (schedule.days.includes(previous) && minutes < window.end) return true;
-	}
-
-	return false;
+	if (window.end > window.start) return days.includes(day) && minutes >= window.start && minutes < window.end;
+	// A window that runs past midnight started on the previous UTC day.
+	const previous = (day + 6) % 7;
+	return (days.includes(day) && minutes >= window.start) || (days.includes(previous) && minutes < window.end);
 }
 
+/** The multiplier in force at `startedAt`: a window's own, the schedule's, or `outside`. */
 export function multiplierAt(startedAt: Date, schedule: Schedule): number {
-	return isPeakAt(startedAt, schedule) ? schedule.multiplier : 1;
+	for (const window of schedule.windows) {
+		if (windowCovers(window, startedAt, schedule.days)) return window.multiplier ?? schedule.multiplier;
+	}
+	return schedule.outside;
+}
+
+/** Whether the rate in force costs more than the one pi recorded. */
+export function isPeakAt(startedAt: Date, schedule: Schedule): boolean {
+	return multiplierAt(startedAt, schedule) > 1;
 }
 
 /** Glob match supporting `*` only, which is all a provider/model filter needs. */
@@ -205,19 +282,50 @@ export function matchesSchedule(schedule: Schedule, provider: string, model: str
 	);
 }
 
+/** The provider/model pair a request belongs to, as pi reports it. */
+export interface ModelKey {
+	provider: string;
+	id: string;
+}
+
+/** The first schedule covering a provider/model pair. */
+export function scheduleFor(schedules: Schedule[], provider: string, model: string): Schedule | undefined {
+	return schedules.find((schedule) => matchesSchedule(schedule, provider, model));
+}
+
+/** Whether the rate in force costs more (`peak`), less (`off-peak`), or the same (`none`). */
+export type RateState = "peak" | "off-peak" | "none";
+
+export function rateStateAt(when: Date, schedule: Schedule): RateState {
+	const multiplier = multiplierAt(when, schedule);
+	if (multiplier > 1) return "peak";
+	if (multiplier < 1) return "off-peak";
+	return "none";
+}
+
 /**
  * The footer indicator for a selected model, or undefined when it should be
- * absent: correction disabled, no model selected, a model the schedule does not
- * cover, or an off-peak clock.
+ * absent: correction disabled, no model selected, a model no schedule covers, or
+ * a rate that already matches the billed one.
  */
 export function statusIndicator(
-	schedule: Schedule,
+	schedules: Schedule[],
 	active: boolean,
 	model: ModelKey | undefined,
 	now: Date = new Date(),
 ): string | undefined {
-	if (!active || !model || !matchesSchedule(schedule, model.provider, model.id)) return undefined;
-	return multiplierAt(now, schedule) > 1 ? `· ${STATUS_PEAK}` : undefined;
+	if (!active || !model) return undefined;
+	const schedule = scheduleFor(schedules, model.provider, model.id);
+	if (!schedule) return undefined;
+
+	switch (rateStateAt(now, schedule)) {
+		case "peak":
+			return `· ${STATUS_PEAK}`;
+		case "off-peak":
+			return `· ${STATUS_OFF_PEAK}`;
+		default:
+			return undefined;
+	}
 }
 
 export interface CostBreakdown {
@@ -275,21 +383,33 @@ export function writeActive(path: string, active: boolean): void {
 	}
 }
 
+function formatClock(minutes: number): string {
+	return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
 function describeSchedule(schedule: Schedule): string {
 	const windows = schedule.windows
 		.map((window) => {
-			const fmt = (minutes: number) =>
-				`${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
-			return `${fmt(window.start)}-${fmt(window.end)}`;
+			const multiplier = window.multiplier !== undefined ? ` ×${window.multiplier}` : "";
+			return `${formatClock(window.start)}-${formatClock(window.end)}${multiplier}`;
 		})
 		.join(", ");
 	const days = schedule.days.map((day) => DAY_NAMES[day]).join(",");
-	return `${windows} UTC (${days}) ×${schedule.multiplier} for ${schedule.providers.join(",")}`;
+	const inside = windows ? `×${schedule.multiplier} in ${windows}` : `×${schedule.multiplier} always`;
+	return `${inside}, ×${schedule.outside} outside (${days} UTC) for ${schedule.providers.join(",")}`;
+}
+
+function describeAll(schedules: Schedule[]): string {
+	const configured = schedules.filter(
+		(schedule) => schedule.windows.length > 0 || schedule.multiplier !== 1 || schedule.outside !== 1,
+	);
+	if (configured.length === 0) return "no schedule configured";
+	return configured.map(describeSchedule).join(" | ");
 }
 
 export default function peakHours(pi: ExtensionAPI): void {
 	let config = readConfig(CONFIG_PATH) ?? {};
-	let schedule = resolveSchedule(config);
+	let schedules = resolveSchedules(config);
 	let active = config.active ?? DEFAULT_ACTIVE;
 	/** Messages already scaled; retries can re-deliver the same object. */
 	const adjusted = new WeakSet<AssistantMessage>();
@@ -297,12 +417,12 @@ export default function peakHours(pi: ExtensionAPI): void {
 
 	function refresh(): void {
 		config = readConfig(CONFIG_PATH) ?? {};
-		schedule = resolveSchedule(config);
+		schedules = resolveSchedules(config);
 		active = config.active ?? DEFAULT_ACTIVE;
 	}
 
 	function updateStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
-		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedule, active, model));
+		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedules, active, model));
 	}
 
 	function notifyStatus(ctx: ExtensionContext, model: ModelKey | undefined = ctx.model): void {
@@ -310,19 +430,24 @@ export default function peakHours(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Peak hours: off.`, "info");
 			return;
 		}
-		// The schedule is provider-scoped, so name why nothing applies to a model it
-		// does not cover instead of reporting a rate that will never be charged.
+		// Schedules are provider-scoped, so name why nothing applies to a model none
+		// of them cover instead of reporting a rate that will never be charged.
 		if (!model) {
-			ctx.ui.notify(`Peak hours: no model selected. ${describeSchedule(schedule)}`, "info");
+			ctx.ui.notify(`Peak hours: no model selected. ${describeAll(schedules)}`, "info");
 			return;
 		}
-		if (!matchesSchedule(schedule, model.provider, model.id)) {
-			ctx.ui.notify(`Peak hours: not applied to ${model.provider}/${model.id}. ${describeSchedule(schedule)}`, "info");
+		const schedule = scheduleFor(schedules, model.provider, model.id);
+		if (!schedule) {
+			ctx.ui.notify(`Peak hours: not applied to ${model.provider}/${model.id}. ${describeAll(schedules)}`, "info");
 			return;
 		}
-		const now = new Date();
-		const multiplier = multiplierAt(now, schedule);
-		const state = multiplier > 1 ? `peak ×${multiplier} right now` : "off-peak right now";
+		const multiplier = multiplierAt(new Date(), schedule);
+		const state =
+			multiplier > 1
+				? `peak ×${multiplier} right now`
+				: multiplier < 1
+					? `off-peak ×${multiplier} right now`
+					: "no correction right now";
 		ctx.ui.notify(`Peak hours: ${state}. ${describeSchedule(schedule)}`, "info");
 	}
 
@@ -355,7 +480,12 @@ export default function peakHours(pi: ExtensionAPI): void {
 		const startedAt = pendingStart ?? message.timestamp ?? Date.now();
 		pendingStart = undefined;
 
-		if (!active || !matchesSchedule(schedule, message.provider, message.model)) {
+		if (!active) {
+			updateStatus(ctx);
+			return;
+		}
+		const schedule = scheduleFor(schedules, message.provider, message.model);
+		if (!schedule) {
 			updateStatus(ctx);
 			return;
 		}

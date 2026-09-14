@@ -4,7 +4,7 @@ Correct pi's recorded cost for providers that bill by time of day, and show the 
 
 DeepSeek is the current example. Its published prices are the **off-peak** rates, and a **2x** multiplier applies during peak windows — `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, with every other hour (including all weekend) off-peak. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session running during a peak window understates its cost by up to 2x.
 
-This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. While peak is in force **for the selected provider and model** the status shows `▲ peak`; off-peak, on an uncovered model, or with correction off it clears. The indicator stays generic because the multiplier differs per service — `/peak-hours status` names the schedule, the rate in force, and whether the current model is covered.
+This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. While a corrected rate is in force **for the selected provider and model** the footer shows it: `▲ peak` when the hour costs more than the rate pi recorded, `▼ off-peak` when it costs less. `/peak-hours status` names the schedule and the rate in force.
 
 ## Install
 
@@ -29,6 +29,7 @@ Optional. `~/.pi/agent/extensions/pi-peak-hours.json` overlays the built-in Deep
 {
   "active": true,
   "multiplier": 2,
+  "outside": 1,
   "windows": [["01:00", "04:00"], ["06:00", "10:00"]],
   "days": ["mon", "tue", "wed", "thu", "fri"],
   "providers": ["deepseek"],
@@ -38,11 +39,52 @@ Optional. `~/.pi/agent/extensions/pi-peak-hours.json` overlays the built-in Deep
 
 Times are **UTC**. `days` accepts names or `0`–`6` (`0` is Sunday). `providers` and `models` accept `*` globs, so an OpenRouter route (`"providers": ["openrouter"], "models": ["deepseek/*"]`) picks up the same schedule.
 
+`multiplier` applies **inside** `windows` and `outside` applies everywhere else. Either may be below 1, because not every provider prices the same way round. A window may carry its own `multiplier`, which wins for that window:
+
+```json
+"windows": [{ "start": "22:00", "end": "08:00", "multiplier": 0.4 }]
+```
+
+**Pick the side that matches your own rate card.** The extension applies the difference from the rate pi recorded; it does not guess which side that is. `pi models-store.json` and `~/.pi/agent/models.json` disagree in practice — DeepSeek direct is listed at its **peak** rate, the same model through OpenRouter at its **off-peak** rate — so a schedule that assumed one of them would double-charge the other. `/peak-hours status` reports what it would charge right now, and the numbers are in the provider's docs.
+
+### Other providers
+
+A `schedules` list replaces the built-in DeepSeek schedule with one entry per service. Each entry starts from a clean slate rather than inheriting DeepSeek's windows.
+
+**Z.ai coding plan** — the standard credit rate during the weekday peak window, half of it everywhere else (docs.z.ai/devpack). This is inverted relative to DeepSeek: `06:00–10:00` UTC Monday–Friday is the *expensive* side, so the windows match and the multiplier lands below 1.
+
+```json
+{
+  "schedules": [
+    { "providers": ["zai"], "windows": [["06:00", "10:00"]], "days": ["mon", "tue", "wed", "thu", "fri"],
+      "multiplier": 1, "outside": 0.5 }
+  ]
+}
+```
+
+Note that a coding plan is billed in credits against a subscription, so pi's cost for it is a list-price estimate either way.
+
+**Alibaba Model Studio (Qwen)** — a limited-time night discount: night is `22:00–08:00` UTC+8 (`14:00–00:00` UTC) and the percentage is quoted per model, so the schedule is per model too. The example below is the published `night 60% off / daytime 20% off` shape.
+
+```json
+{
+  "schedules": [
+    { "providers": ["qwen"], "models": ["qwen3.8-max"],
+      "windows": [
+        { "start": "14:00", "end": "00:00", "multiplier": 0.4 },
+        { "start": "00:00", "end": "14:00", "multiplier": 0.8 }
+      ], "outside": 1 }
+  ]
+}
+```
+
+OpenRouter publishes the same windows machine-readably for models it hosts (`pricing.overrides` with `utc_days` / `utc_start` / `utc_end` on `https://openrouter.ai/api/v1/models`), but this extension reads its schedule from config rather than the network: the correction is a rate difference, not a price lookup, and a fetch would add a failure mode to a handler that must never throw.
+
 A malformed field falls back to its default rather than disabling the extension; a malformed file warns once and resolves to defaults.
 
 ## Design notes
 
-- **Only the selected model drives the indicator.** The schedule is provider- and model-scoped, so the footer never shows `peak` for a service that does not bill by time of day; switching models re-evaluates it.
+- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day; switching models re-evaluates it. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak.
 - **Rate by request start.** DeepSeek bills by arrival time, so the multiplier is chosen from the `message_start` timestamp rather than `message_end`. A request spanning a window boundary would otherwise land on the wrong side.
 - **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.
