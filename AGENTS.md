@@ -21,6 +21,7 @@ No build step — pi loads the extension directly.
 - Rate selection uses the request start time from `message_start`, never `message_end`, because the provider bills by arrival.
 - A message is scaled at most once, including the replacement returned to pi; retries re-deliver the same object.
 - The footer quotes the rate in force (input/output per million tokens) and names the direction: `▲ peak` above the recorded rate, `▼ off-peak` below it.
+- The footer follows the window it quotes. pi emits nothing while a session is idle, so a timer armed at the next window boundary re-renders the status; it is armed only while the selected model has a schedule and a rate to keep fresh, and cleared in `session_shutdown`.
 - Only the four cost fields change and `total` is recomputed from them. Token counts are never modified.
 - Malformed configuration falls back to defaults; the extension never throws inside a message handler.
 
@@ -31,6 +32,6 @@ Merge only a coherent, independently usable slice: it must be complete as a user
 ## Key Files
 
 ```
-extensions/index.ts   # schedule parsing, peak detection, cost correction, command
+extensions/index.ts   # schedule parsing, peak detection, cost correction, status timer, command
 tests/                # schedule, boundary, wrapping-window, config, and handler tests
 ```

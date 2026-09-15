@@ -25,7 +25,7 @@ Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine 
 /peak-hours on|off    # toggle correction; persists to pi-peak-hours.json
 ```
 
-The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized, so a window boundary crossed mid-session is picked up by the next turn.
+The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized — and it arms a timer for the next window boundary, so a session sitting idle across 04:00 UTC flips to the new rate on time instead of at its next turn.
 
 ## Configuration
 
@@ -99,6 +99,7 @@ A malformed field falls back to its default rather than disabling the extension;
 ## Design notes
 
 - **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak. The quoted rate and the written cost come from the same multiplication, so they cannot disagree.
+- **The footer follows the window it quotes.** pi has no render tick and fires no event while a session is idle, and a rate that changes at 04:00 would otherwise stay on screen until the next turn. The extension arms a single timer for the next instant the selected model's multiplier moves, and re-arms it after each fire. The timer is unreferenced and cleared on session shutdown, so it neither holds pi open nor outlives its session.
 - **Rate by request start.** DeepSeek bills by arrival time, so the multiplier is chosen from the `message_start` timestamp rather than `message_end`. A request spanning a window boundary would otherwise land on the wrong side.
 - **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity; the replacement returned to pi is registered too, so a replayed replacement cannot be scaled twice.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.

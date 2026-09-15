@@ -13,6 +13,7 @@ import {
 	matchesSchedule,
 	multiplierAt,
 	NEUTRAL_SCHEDULE,
+	nextTransitionAt,
 	parseClock,
 	parseDay,
 	parseMultiplier,
@@ -229,6 +230,51 @@ describe("multiplierAt", () => {
 		expect(multiplierAt(weekday(2), schedule)).toBe(3);
 		expect(multiplierAt(weekday(7), schedule)).toBe(2);
 		expect(multiplierAt(weekday(5), schedule)).toBe(1);
+	});
+});
+
+describe("nextTransitionAt", () => {
+	test("lands on the edge the multiplier actually moves on", () => {
+		// Every half hour across a week: the edge must be ahead of the clock, must
+		// carry a different multiplier than the instant before it, and must be a real
+		// change rather than a redraw.
+		for (let step = 0; step < 7 * 48; step++) {
+			const now = new Date(Date.UTC(2026, 8, 7) + step * 30 * 60_000);
+			const before = multiplierAt(now, DEFAULT_SCHEDULE);
+			const next = nextTransitionAt(now, DEFAULT_SCHEDULE);
+
+			expect(next).toBeDefined();
+			const at = next?.getTime() ?? 0;
+			expect(at).toBeGreaterThan(now.getTime());
+			expect(multiplierAt(new Date(at), DEFAULT_SCHEDULE)).not.toBe(before);
+			expect(multiplierAt(new Date(at - 1), DEFAULT_SCHEDULE)).toBe(before);
+		}
+	});
+
+	test("finds the closing edge of a window that wraps midnight", () => {
+		const schedule = resolveSchedule({ windows: [["23:00", "02:00"]], days: ["fri"] });
+		const at = (iso: string) => nextTransitionAt(new Date(iso), schedule)?.toISOString();
+
+		expect(at("2026-09-11T23:30:00Z")).toBe("2026-09-12T02:00:00.000Z");
+		// Saturday 01:00 is inside Friday's tail, so the tail's end is still ahead.
+		expect(at("2026-09-12T01:00:00Z")).toBe("2026-09-12T02:00:00.000Z");
+		// Once the tail closes, nothing moves until the next Friday.
+		expect(at("2026-09-12T03:00:00Z")).toBe("2026-09-18T23:00:00.000Z");
+	});
+
+	test("prefers the window's own multiplier over the schedule's", () => {
+		const schedule = resolveSchedule({
+			multiplier: 2,
+			outside: 1,
+			windows: [{ start: "01:00", end: "04:00", multiplier: 3 }],
+		});
+
+		expect(nextTransitionAt(weekday(0, 30), schedule)?.toISOString()).toBe("2026-09-10T01:00:00.000Z");
+		expect(nextTransitionAt(weekday(2), schedule)?.toISOString()).toBe("2026-09-10T04:00:00.000Z");
+	});
+
+	test("has nothing to transition to when no window exists", () => {
+		expect(nextTransitionAt(weekday(2), NEUTRAL_SCHEDULE)).toBeUndefined();
 	});
 });
 

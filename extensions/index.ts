@@ -21,6 +21,10 @@
  * extension writes. A session on a provider or model no schedule covers never
  * shows a rate, and switching models re-evaluates it.
  *
+ * The indicator is a snapshot of the current hour, and pi fires no event while a
+ * session sits idle — so a timer armed at the next window boundary keeps it from
+ * quoting a rate that has already expired. See `arm`.
+ *
  * Schedules are provider-scoped and there can be several, because the shape of
  * the correction differs: DeepSeek's list price is its off-peak rate, so peak is
  * a surcharge (×2), while Z.ai's coding plan and Alibaba's night discount are
@@ -285,6 +289,42 @@ export function isPeakAt(startedAt: Date, schedule: Schedule): boolean {
 	return multiplierAt(startedAt, schedule) > 1;
 }
 
+const MS_PER_MINUTE = 60_000;
+
+/**
+ * The earliest instant after `now` at which the schedule's multiplier changes,
+ * or undefined when it never does. The multiplier only moves on a window edge,
+ * so those edges are the only instants worth recomputing a rate for.
+ */
+export function nextTransitionAt(now: Date, schedule: Schedule): Date | undefined {
+	if (schedule.windows.length === 0) return undefined;
+	const nowMs = now.getTime();
+	let next: number | undefined;
+
+	// A week of days plus a day of slack, so a window that wraps midnight always
+	// contributes its closing edge to the scan.
+	for (let offset = 0; offset <= 8; offset++) {
+		const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + offset);
+		const day = new Date(midnight).getUTCDay();
+		const previousDay = (day + 6) % 7;
+
+		for (const window of schedule.windows) {
+			// A window opens on its own day and closes on that day, or on the next one
+			// when it runs past midnight.
+			const closesOn = window.end > window.start ? day : previousDay;
+			const edges = [
+				schedule.days.includes(day) ? midnight + window.start * MS_PER_MINUTE : undefined,
+				schedule.days.includes(closesOn) ? midnight + window.end * MS_PER_MINUTE : undefined,
+			];
+			for (const edge of edges) {
+				if (edge !== undefined && edge > nowMs && (next === undefined || edge < next)) next = edge;
+			}
+		}
+	}
+
+	return next === undefined ? undefined : new Date(next);
+}
+
 /** Glob match supporting `*` only, which is all a provider/model filter needs. */
 export function matchesPattern(pattern: string, value: string): boolean {
 	if (pattern === "*") return true;
@@ -486,6 +526,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	let active = config.active ?? DEFAULT_ACTIVE;
 	const adjusted = adjustedMessages();
 	let pendingStart: number | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	function refresh(): void {
 		config = readConfig(configPath) ?? {};
@@ -493,8 +534,40 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		active = config.active ?? DEFAULT_ACTIVE;
 	}
 
+	function disarm(): void {
+		if (timer === undefined) return;
+		clearTimeout(timer);
+		timer = undefined;
+	}
+
+	/**
+	 * Keep the footer in step with the window it quotes. pi fires no event while a
+	 * session sits idle, so a session idle across a boundary would keep describing
+	 * a rate that has expired. Armed from `updateStatus`, so it follows the same
+	 * inputs a status does: the schedule in force, the toggle, and the model.
+	 */
+	function arm(ctx: ExtensionContext, model: ModelRate | undefined): void {
+		disarm();
+		// Print and JSON modes have no footer to hold a stale rate.
+		if (!active || !ctx.hasUI || !model) return;
+		const schedule = scheduleFor(schedules, model.provider, model.id);
+		if (!schedule) return;
+
+		const next = nextTransitionAt(new Date(), schedule);
+		if (!next) return;
+		// Floored, so a boundary crossed between reading the clock and arming the
+		// timer cannot spin it; unreferenced, so a pending window never keeps pi
+		// alive after its work is done.
+		timer = setTimeout(() => {
+			timer = undefined;
+			updateStatus(ctx);
+		}, Math.max(1000, next.getTime() - Date.now()));
+		timer.unref();
+	}
+
 	function updateStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {
 		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedules, active, model));
+		arm(ctx, model);
 	}
 
 	function notifyStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {
@@ -532,6 +605,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingStart = undefined;
+		disarm();
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 

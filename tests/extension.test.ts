@@ -3,10 +3,11 @@
  * pi emits, so the wiring (not just the pure schedule maths) is covered.
  *
  * The configs below cover every hour of the day, which keeps the multiplicand
- * deterministic without freezing the clock.
+ * deterministic without freezing the clock. The boundary-timer tests do freeze
+ * it, because the instant a window turns over is the behavior under test.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -63,7 +64,7 @@ function assistantMessage(overrides: { provider?: string; model?: string; usage?
 	} as unknown as AssistantMessage;
 }
 
-function harness(path: string) {
+function harness(path: string, options: { hasUI?: boolean } = {}) {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 	const commands = new Map<string, CommandOptions>();
 	peakHours(
@@ -82,6 +83,7 @@ function harness(path: string) {
 	const notes: string[] = [];
 	let model: ModelRate | undefined;
 	const ctx = {
+		hasUI: options.hasUI ?? true,
 		ui: {
 			setStatus: (key: string, value?: string) => {
 				if (key === STATUS_KEY) statuses.push(value);
@@ -115,6 +117,50 @@ function harness(path: string) {
 
 function write(path: string, config: unknown): void {
 	writeFileSync(path, `${JSON.stringify(config)}\n`, "utf8");
+}
+
+interface TimerHandle {
+	unref: () => void;
+	run: () => void;
+	delay: number;
+	/** Pending: neither fired nor cleared. */
+	live: boolean;
+}
+
+/**
+ * Hold the timers the extension schedules, so a boundary can be crossed without
+ * waiting for it. `restore` has to run even when an assertion fails.
+ */
+function captureTimers() {
+	const timers: TimerHandle[] = [];
+	const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		delay?: number,
+	) => {
+		const handle: TimerHandle = {
+			unref: () => {},
+			delay: delay ?? 0,
+			live: true,
+			run: () => {
+				handle.live = false;
+				callback();
+			},
+		};
+		timers.push(handle);
+		return handle;
+	}) as unknown as typeof setTimeout);
+	const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((handle: TimerHandle) => {
+		handle.live = false;
+	}) as unknown as typeof clearTimeout);
+
+	return {
+		timers,
+		armed: () => timers.filter((timer) => timer.live),
+		restore: () => {
+			setSpy.mockRestore();
+			clearSpy.mockRestore();
+		},
+	};
 }
 
 describe("peak hours handlers", () => {
@@ -296,5 +342,100 @@ describe("peak hours handlers", () => {
 
 		expect(h.status()).toBeUndefined();
 		expect(await h.emit("message_end", { message: assistantMessage() })).toBeUndefined();
+	});
+});
+
+describe("window boundary timer", () => {
+	/** One window, every day, so the clock can be moved to any hour under test. */
+	const NIGHT_WINDOW = {
+		providers: ["deepseek"],
+		models: ["*"],
+		days: ALL_DAYS,
+		windows: [["01:00", "04:00"]],
+		multiplier: 2,
+		outside: 1,
+	};
+
+	test("re-renders the footer when the window turns over while the session is idle", async () => {
+		const path = configPath();
+		write(path, NIGHT_WINDOW);
+		const h = harness(path);
+		h.select(DEEPSEEK);
+
+		// 2026-09-15 is a Tuesday, so 03:59:30Z is 30 seconds inside the window.
+		setSystemTime(new Date("2026-09-15T03:59:30Z"));
+		const timers = captureTimers();
+
+		try {
+			await h.emit("session_start");
+			expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+			// Armed for the boundary itself, not for a poll interval.
+			expect(timers.armed()).toHaveLength(1);
+			expect(timers.armed()[0]?.delay).toBe(30_000);
+
+			// An idle half-minute: no turn, no message, no model change. Only the timer runs.
+			setSystemTime(new Date("2026-09-15T04:00:01Z"));
+			timers.armed()[0]?.run();
+
+			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
+			// The expired timer is gone, and the next boundary is 01:00 the next day.
+			expect(timers.armed()).toHaveLength(1);
+			expect(timers.armed()[0]?.delay).toBe(new Date("2026-09-16T01:00:00Z").getTime() - Date.now());
+		} finally {
+			timers.restore();
+			setSystemTime();
+		}
+	});
+
+	test("keeps a timer armed only while a rate is there to keep fresh", async () => {
+		const path = configPath();
+		write(path, NIGHT_WINDOW);
+		const h = harness(path);
+		const timers = captureTimers();
+
+		try {
+			// A model no schedule covers has no footer entry that can expire.
+			h.select(ASTRA);
+			await h.emit("session_start");
+			expect(timers.armed()).toHaveLength(0);
+
+			h.select(DEEPSEEK);
+			await h.emit("model_select", { model: DEEPSEEK });
+			expect(timers.armed()).toHaveLength(1);
+
+			// Switching away disarms what the covered model armed.
+			h.select(ASTRA);
+			await h.emit("model_select", { model: ASTRA });
+			expect(timers.armed()).toHaveLength(0);
+
+			h.select(DEEPSEEK);
+			await h.emit("model_select", { model: DEEPSEEK });
+			await h.command("off");
+			expect(timers.armed()).toHaveLength(0);
+
+			await h.emit("turn_start");
+			await h.emit("session_shutdown");
+			// Nothing it armed is still pending once the session it was armed for ends.
+			expect(timers.timers.some((timer) => timer.live)).toBe(false);
+		} finally {
+			timers.restore();
+		}
+	});
+
+	test("leaves print and JSON modes alone", async () => {
+		const path = configPath();
+		write(path, NIGHT_WINDOW);
+		const h = harness(path, { hasUI: false });
+		h.select(DEEPSEEK);
+		const timers = captureTimers();
+
+		try {
+			await h.emit("session_start");
+			// The status is still computed; there is just no footer to refresh.
+			expect(h.status()).toBeDefined();
+			expect(timers.armed()).toHaveLength(0);
+		} finally {
+			timers.restore();
+		}
 	});
 });
