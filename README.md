@@ -4,11 +4,11 @@ Correct pi's recorded cost for providers that bill by time of day, and show the 
 
 DeepSeek is the current example. Its peak windows are `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, and off-peak is half the peak rate. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session is over- or understated by up to 2x depending on which side of the schedule the recorded rate sits.
 
-Two schedules ship built in, because pi's own catalog is inconsistent about that side: `deepseek/deepseek-flash` direct is listed at its **peak** rate while the same model through OpenRouter is listed at its **off-peak** rate. The DeepSeek schedule therefore scales the OpenRouter route by 2 during peak windows and leaves the direct provider alone; naming your own providers in the config replaces both.
+Two schedules ship built in, both shaped `×2` inside the peak windows and `×1` outside — the shape a catalog needs when it records the **off-peak** rate. Stock pi.dev needs that shape for one route only: it lists the same model through OpenRouter at its off-peak rate, and direct as `deepseek-flash` at its **peak** rate. So the OpenRouter entry is right as shipped, and the direct entry is right for a catalog that pins direct to off-peak, as `models.json` can; on stock pi.dev's direct provider the shape is inverted and the configuration below sets it right. Each entry is scoped so the DeepSeek models are covered on both routes without claiming unrelated OpenRouter models, and naming your own providers replaces both.
 
 This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. The status line quotes the rate in force for the selected model — `· ▲ peak $0.30/$1.20/M` during a peak window, `· $0.15/$0.60/M` off it — with `▲ peak` or `▼ off-peak` added when the hour costs more or less than the rate pi recorded. `/peak-hours status` names the schedule behind it.
 
-The quoted rate is pi's recorded rate scaled by the schedule, so it always agrees with the cost written to the session. Where pi's rate table is stale or wrong for your route, the quoted rate is stale in the same way — the extension corrects the shape of the bill, not the base rate.
+The quoted rate is pi's recorded rate scaled by the schedule, so it always agrees with the cost written to the session. It describes the hour in force rather than a particular request, though: a request that started before a boundary is billed by its start time while the footer has already moved to the new hour. Where pi's rate table is stale or wrong for your route, the quoted rate is stale in the same way — the extension corrects the shape of the bill, not the base rate.
 
 ## Install
 
@@ -25,7 +25,7 @@ Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine 
 /peak-hours on|off    # toggle correction; persists to pi-peak-hours.json
 ```
 
-The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized — and it arms a timer for the next window boundary, so a session sitting idle across 04:00 UTC flips to the new rate on time instead of at its next turn.
+The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized — and it arms a timer for the next instant the rate it quotes actually changes, so a session sitting idle across 04:00 UTC flips to the new rate on time instead of at its next turn.
 
 ## Configuration
 
@@ -94,12 +94,12 @@ Note that a coding plan is billed in credits against a subscription, so pi's cos
 
 OpenRouter publishes the same windows machine-readably for models it hosts (`pricing.overrides` with `utc_days` / `utc_start` / `utc_end` on `https://openrouter.ai/api/v1/models`), but this extension reads its schedule from config rather than the network: the correction is a rate difference, not a price lookup, and a fetch would add a failure mode to a handler that must never throw.
 
-A malformed field falls back to its default rather than disabling the extension; a malformed file warns once and resolves to defaults.
+A malformed field falls back to its default rather than disabling the extension; a malformed file warns and resolves to defaults.
 
 ## Design notes
 
 - **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak. The quoted rate and the written cost come from the same multiplication, so they cannot disagree.
-- **The footer follows the window it quotes.** pi has no render tick and fires no event while a session is idle, and a rate that changes at 04:00 would otherwise stay on screen until the next turn. The extension arms a single timer for the next instant the selected model's multiplier moves, and re-arms it after each fire. The timer is unreferenced and cleared on session shutdown, so it neither holds pi open nor outlives its session.
+- **The footer follows the window it quotes.** pi has no render tick and fires no event while a session is idle, and a rate that changes at 04:00 would otherwise stay on screen until the next turn. The extension arms a single timer for the next instant the quoted rate changes and re-arms it after each fire, from the same clock reading as the status it is keeping fresh. It arms nothing when there is no status on screen, and the timer is unreferenced and cleared on session shutdown, so it neither holds pi open nor outlives its session.
 - **Rate by request start.** DeepSeek bills by arrival time, so the multiplier is chosen from the `message_start` timestamp rather than `message_end`. A request spanning a window boundary would otherwise land on the wrong side.
 - **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity; the replacement returned to pi is registered too, so a replayed replacement cannot be scaled twice.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.
