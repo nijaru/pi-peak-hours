@@ -169,6 +169,14 @@ export const NEUTRAL_SCHEDULE: Schedule = {
 
 export const DEFAULT_ACTIVE = true;
 
+/**
+ * Only an explicit boolean is a toggle. A malformed `active` falls back like
+ * every other field, so a typo disables nothing silently.
+ */
+export function parseActive(value: unknown): boolean {
+	return typeof value === "boolean" ? value : DEFAULT_ACTIVE;
+}
+
 /** "HH:MM" in UTC to minutes from midnight, or undefined when unparseable. */
 export function parseClock(value: unknown): number | undefined {
 	if (typeof value !== "string") return undefined;
@@ -292,17 +300,15 @@ export function isPeakAt(startedAt: Date, schedule: Schedule): boolean {
 const MS_PER_MINUTE = 60_000;
 
 /**
- * The earliest instant after `now` at which the schedule's multiplier changes,
- * or undefined when it never does. The multiplier only moves on a window edge,
- * so those edges are the only instants worth recomputing a rate for.
+ * Every instant the multiplier could move: the edges of each window, over a week
+ * of days plus a day of slack so a window that wraps midnight always contributes
+ * its closing edge and every weekday appears at least once. Sorted, and only
+ * ahead of `now`.
  */
-export function nextTransitionAt(now: Date, schedule: Schedule): Date | undefined {
-	if (schedule.windows.length === 0) return undefined;
+function candidateEdges(now: Date, schedule: Schedule): number[] {
 	const nowMs = now.getTime();
-	let next: number | undefined;
+	const edges: number[] = [];
 
-	// A week of days plus a day of slack, so a window that wraps midnight always
-	// contributes its closing edge to the scan.
 	for (let offset = 0; offset <= 8; offset++) {
 		const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + offset);
 		const day = new Date(midnight).getUTCDay();
@@ -312,17 +318,37 @@ export function nextTransitionAt(now: Date, schedule: Schedule): Date | undefine
 			// A window opens on its own day and closes on that day, or on the next one
 			// when it runs past midnight.
 			const closesOn = window.end > window.start ? day : previousDay;
-			const edges = [
-				schedule.days.includes(day) ? midnight + window.start * MS_PER_MINUTE : undefined,
-				schedule.days.includes(closesOn) ? midnight + window.end * MS_PER_MINUTE : undefined,
-			];
-			for (const edge of edges) {
-				if (edge !== undefined && edge > nowMs && (next === undefined || edge < next)) next = edge;
-			}
+			if (schedule.days.includes(day)) edges.push(midnight + window.start * MS_PER_MINUTE);
+			if (schedule.days.includes(closesOn)) edges.push(midnight + window.end * MS_PER_MINUTE);
 		}
 	}
 
-	return next === undefined ? undefined : new Date(next);
+	return edges.filter((edge) => edge > nowMs).sort((left, right) => left - right);
+}
+
+/**
+ * The earliest instant after `now` at which the schedule's multiplier changes,
+ * or undefined when it never does.
+ *
+ * A window edge is not enough: windows can overlap, so the edge that opens one
+ * may land inside another and leave the rate where it was. Testing the
+ * multiplier on both sides of each edge keeps the footer's trigger and the
+ * footer's value on the same function, and leaves a schedule whose multiplier
+ * never moves — a `multiplier` equal to its `outside`, say — with no timer at
+ * all.
+ */
+export function nextTransitionAt(now: Date, schedule: Schedule): Date | undefined {
+	if (schedule.windows.length === 0) return undefined;
+
+	// Edges are ordered, so the multiplier is constant between consecutive ones:
+	// the first edge that moves it is the first change after `now`.
+	for (const edge of candidateEdges(now, schedule)) {
+		if (multiplierAt(new Date(edge), schedule) !== multiplierAt(new Date(edge - 1), schedule)) {
+			return new Date(edge);
+		}
+	}
+
+	return undefined;
 }
 
 /** Glob match supporting `*` only, which is all a provider/model filter needs. */
@@ -523,7 +549,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	const configPath = options.configPath ?? CONFIG_PATH;
 	let config = readConfig(configPath) ?? {};
 	let schedules = resolveSchedules(config);
-	let active = config.active ?? DEFAULT_ACTIVE;
+	let active = parseActive(config.active);
 	const adjusted = adjustedMessages();
 	let pendingStart: number | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -531,7 +557,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	function refresh(): void {
 		config = readConfig(configPath) ?? {};
 		schedules = resolveSchedules(config);
-		active = config.active ?? DEFAULT_ACTIVE;
+		active = parseActive(config.active);
 	}
 
 	function disarm(): void {
@@ -543,17 +569,19 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	/**
 	 * Keep the footer in step with the window it quotes. pi fires no event while a
 	 * session sits idle, so a session idle across a boundary would keep describing
-	 * a rate that has expired. Armed from `updateStatus`, so it follows the same
-	 * inputs a status does: the schedule in force, the toggle, and the model.
+	 * a rate that has expired. Armed only for a `status` that is on screen, and
+	 * from the instant that status was computed: `now` is the one clock reading
+	 * shared by the rate and the boundary that ends it, so the last millisecond of
+	 * a window cannot arm the timer past its own edge.
 	 */
-	function arm(ctx: ExtensionContext, model: ModelRate | undefined): void {
+	function arm(ctx: ExtensionContext, model: ModelRate | undefined, status: string | undefined, now: Date): void {
 		disarm();
-		// Print and JSON modes have no footer to hold a stale rate.
-		if (!active || !ctx.hasUI || !model) return;
+		// Nothing to keep fresh, or no footer to keep fresh in.
+		if (status === undefined || !ctx.hasUI || !model) return;
 		const schedule = scheduleFor(schedules, model.provider, model.id);
 		if (!schedule) return;
 
-		const next = nextTransitionAt(new Date(), schedule);
+		const next = nextTransitionAt(now, schedule);
 		if (!next) return;
 		// Floored, so a boundary crossed between reading the clock and arming the
 		// timer cannot spin it; unreferenced, so a pending window never keeps pi
@@ -561,13 +589,15 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		timer = setTimeout(() => {
 			timer = undefined;
 			updateStatus(ctx);
-		}, Math.max(1000, next.getTime() - Date.now()));
-		timer.unref();
+		}, Math.max(1000, next.getTime() - now.getTime()));
+		timer.unref?.();
 	}
 
 	function updateStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {
-		ctx.ui.setStatus(STATUS_KEY, statusIndicator(schedules, active, model));
-		arm(ctx, model);
+		const now = new Date();
+		const status = statusIndicator(schedules, active, model, now);
+		ctx.ui.setStatus(STATUS_KEY, status);
+		arm(ctx, model, status, now);
 	}
 
 	function notifyStatus(ctx: ExtensionContext, model: ModelRate | undefined = ctx.model): void {

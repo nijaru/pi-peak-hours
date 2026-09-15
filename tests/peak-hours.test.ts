@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
 	applyMultiplier,
+	DEFAULT_ACTIVE,
 	DEFAULT_SCHEDULE,
 	DEFAULT_SCHEDULES,
 	describeRate,
@@ -17,6 +18,7 @@ import {
 	parseClock,
 	parseDay,
 	parseMultiplier,
+	parseActive,
 	readConfig,
 	resolveSchedule,
 	resolveSchedules,
@@ -273,8 +275,29 @@ describe("nextTransitionAt", () => {
 		expect(nextTransitionAt(weekday(2), schedule)?.toISOString()).toBe("2026-09-10T04:00:00.000Z");
 	});
 
-	test("has nothing to transition to when no window exists", () => {
+	test("skips an edge that leaves the rate where it was", () => {
+		// Window 1 wraps midnight and outranks window 2 in array order, so window 2
+		// opening at 02:14 changes nothing; the rate moves when window 1 closes.
+		const schedule = resolveSchedule({
+			multiplier: 0.5,
+			outside: 1,
+			windows: [
+				{ start: "18:17", end: "05:54" },
+				{ start: "02:14", end: "10:19", multiplier: 2 },
+			],
+			days: ["wed", "thu"],
+		});
+
+		const now = new Date("2026-09-03T02:09:40Z");
+		expect(multiplierAt(now, schedule)).toBe(0.5);
+		expect(multiplierAt(new Date("2026-09-03T02:14:00Z"), schedule)).toBe(0.5);
+		expect(nextTransitionAt(now, schedule)?.toISOString()).toBe("2026-09-03T05:54:00.000Z");
+	});
+
+	test("has nothing to transition to when the rate never moves", () => {
 		expect(nextTransitionAt(weekday(2), NEUTRAL_SCHEDULE)).toBeUndefined();
+		// A window costing the same as the hours around it is a no-op.
+		expect(nextTransitionAt(weekday(2), resolveSchedule({ multiplier: 2, outside: 2, windows: [["01:00", "04:00"]] }))).toBeUndefined();
 	});
 });
 
@@ -298,6 +321,16 @@ describe("applyMultiplier", () => {
 	test("is a no-op at 1x", () => {
 		const cost = { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 };
 		expect(applyMultiplier(cost, 1)).toEqual(cost);
+	});
+});
+
+describe("parseActive", () => {
+	test("accepts booleans and falls back on anything else", () => {
+		expect(parseActive(true)).toBe(true);
+		expect(parseActive(false)).toBe(false);
+		expect(parseActive(0)).toBe(DEFAULT_ACTIVE);
+		expect(parseActive("false")).toBe(DEFAULT_ACTIVE);
+		expect(parseActive(undefined)).toBe(DEFAULT_ACTIVE);
 	});
 });
 

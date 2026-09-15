@@ -125,6 +125,7 @@ interface TimerHandle {
 	delay: number;
 	/** Pending: neither fired nor cleared. */
 	live: boolean;
+	unrefCalled: boolean;
 }
 
 /**
@@ -138,9 +139,12 @@ function captureTimers() {
 		delay?: number,
 	) => {
 		const handle: TimerHandle = {
-			unref: () => {},
+			unref: () => {
+				handle.unrefCalled = true;
+			},
 			delay: delay ?? 0,
 			live: true,
+			unrefCalled: false,
 			run: () => {
 				handle.live = false;
 				callback();
@@ -343,6 +347,18 @@ describe("peak hours handlers", () => {
 		expect(h.status()).toBeUndefined();
 		expect(await h.emit("message_end", { message: assistantMessage() })).toBeUndefined();
 	});
+
+	test("treats a malformed active flag as the default, not as off", async () => {
+		const path = configPath();
+		write(path, { ...SURCHARGE, active: 0 });
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		await h.emit("session_start");
+
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message: assistantMessage() });
+		expect(result?.message.usage.cost.total).toBeCloseTo(1.5, 12);
+	});
 });
 
 describe("window boundary timer", () => {
@@ -387,7 +403,7 @@ describe("window boundary timer", () => {
 		}
 	});
 
-	test("keeps a timer armed only while a rate is there to keep fresh", async () => {
+	test("keeps a timer armed only while a status is there to refresh", async () => {
 		const path = configPath();
 		write(path, NIGHT_WINDOW);
 		const h = harness(path);
@@ -402,21 +418,62 @@ describe("window boundary timer", () => {
 			h.select(DEEPSEEK);
 			await h.emit("model_select", { model: DEEPSEEK });
 			expect(timers.armed()).toHaveLength(1);
+			// Unreferenced, so a pending boundary never holds the process open.
+			expect(timers.armed()[0]?.unrefCalled).toBe(true);
 
 			// Switching away disarms what the covered model armed.
 			h.select(ASTRA);
 			await h.emit("model_select", { model: ASTRA });
 			expect(timers.armed()).toHaveLength(0);
 
+			// So does turning correction off.
 			h.select(DEEPSEEK);
 			await h.emit("model_select", { model: DEEPSEEK });
+			expect(timers.armed()).toHaveLength(1);
 			await h.command("off");
 			expect(timers.armed()).toHaveLength(0);
 
-			await h.emit("turn_start");
+			// A live timer must not outlive the session it was armed for.
+			await h.command("on");
+			expect(timers.armed()).toHaveLength(1);
 			await h.emit("session_shutdown");
-			// Nothing it armed is still pending once the session it was armed for ends.
-			expect(timers.timers.some((timer) => timer.live)).toBe(false);
+			expect(timers.armed()).toHaveLength(0);
+		} finally {
+			timers.restore();
+		}
+	});
+
+	test("arms nothing for a model with no rate to quote", async () => {
+		const path = configPath();
+		write(path, NIGHT_WINDOW);
+		const h = harness(path);
+		// Covered by the schedule, but pi records no cost for it, so there is no
+		// footer entry for a boundary to invalidate.
+		const free: ModelRate = { provider: "deepseek", id: "deepseek-flash", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+		h.select(free);
+		const timers = captureTimers();
+
+		try {
+			await h.emit("session_start");
+			expect(h.status()).toBeUndefined();
+			expect(timers.armed()).toHaveLength(0);
+		} finally {
+			timers.restore();
+		}
+	});
+
+	test("arms nothing for a schedule whose rate never moves", async () => {
+		const path = configPath();
+		// A window costing the same as the hours around it: a status, but no edge to refresh it at.
+		write(path, { ...NIGHT_WINDOW, multiplier: 1, outside: 1 });
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		const timers = captureTimers();
+
+		try {
+			await h.emit("session_start");
+			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
+			expect(timers.armed()).toHaveLength(0);
 		} finally {
 			timers.restore();
 		}
