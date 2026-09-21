@@ -1,6 +1,6 @@
 {
   "name": "@nijaru/pi-peak-hours",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "Correct pi's recorded cost for providers that bill by time of day, with a peak multiplier in the footer status.",
   "keywords": [
