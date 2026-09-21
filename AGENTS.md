@@ -18,7 +18,7 @@ No build step — pi loads the extension directly.
 
 ## Invariants
 
-- Rate selection uses the request start time from `message_start`, never `message_end`, because the provider bills by arrival.
+- Rate selection uses the logical request start captured in `before_provider_request`, never `message_end`. The provider bills when the request arrives, and `message_start` only fires once the response begins, so a request spanning a window boundary would otherwise be billed on the wrong side of it.
 - A message is scaled at most once, including the replacement returned to pi; retries re-deliver the same object.
 - The footer quotes the rate in force (input/output per million tokens) and names the direction: `▲ peak` above the recorded rate, `▼ off-peak` below it.
 - The footer follows the window it quotes. pi emits nothing while a session is idle, so a timer armed for the next instant the quoted rate changes re-renders it. It is armed only while a status is actually on screen, from the same clock reading as that status, and cleared in `session_shutdown`.
