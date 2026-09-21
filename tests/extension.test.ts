@@ -193,6 +193,36 @@ describe("peak hours handlers", () => {
 		expect(result?.message.usage.input).toBe(1_000_000);
 	});
 
+	test("uses the request start, not the response start, across a window boundary", async () => {
+		const path = configPath();
+		write(path, {
+			providers: ["deepseek"],
+			models: ["*"],
+			days: ALL_DAYS,
+			windows: [["01:00", "02:00"]],
+			multiplier: 2,
+			outside: 1,
+		});
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		try {
+			// 2026-09-15 is a Tuesday. The request arrives before the window opens.
+			setSystemTime(new Date("2026-09-15T00:59:59Z"));
+			await h.emit("session_start");
+			await h.emit("before_provider_request");
+			// The response only begins after the window has opened.
+			setSystemTime(new Date("2026-09-15T01:00:01Z"));
+			const message = assistantMessage();
+			await h.emit("message_start", { message });
+			const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
+			// Off-peak at the request start: no correction is applied.
+			expect(result).toBeUndefined();
+		} finally {
+			await h.emit("session_shutdown");
+			setSystemTime();
+		}
+	});
+
 	test("scales a message at most once, including its replacement", async () => {
 		const path = configPath();
 		write(path, SURCHARGE);

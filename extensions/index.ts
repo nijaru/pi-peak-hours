@@ -552,6 +552,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	let active = parseActive(config.active);
 	const adjusted = adjustedMessages();
 	let pendingStart: number | undefined;
+	let requestStartMs: number | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	function refresh(): void {
@@ -635,6 +636,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingStart = undefined;
+		requestStartMs = undefined;
 		disarm();
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
@@ -649,8 +651,17 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		updateStatus(ctx);
 	});
 
+	// The provider bills when the request arrives, and `message_start` is emitted
+	// only once the response begins, so capture the logical request start here and
+	// fall back to the message clock when no request was observed.
+	pi.on("before_provider_request", async () => {
+		if (active) requestStartMs = Date.now();
+	});
+
 	pi.on("message_start", async (event) => {
-		if (event.message.role === "assistant") pendingStart = Date.now();
+		if (event.message.role !== "assistant") return;
+		pendingStart = requestStartMs ?? Date.now();
+		requestStartMs = undefined;
 	});
 
 	pi.on("message_end", async (event, ctx) => {
