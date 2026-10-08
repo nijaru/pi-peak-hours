@@ -2,7 +2,7 @@
 
 Correct pi's recorded cost for providers that charge more during peak hours, and show the multiplier in the footer status.
 
-DeepSeek bills by time of day: its published rates are the off-peak rates, and a 2x multiplier applies during 01:00–04:00 and 06:00–10:00 UTC on weekdays. pi computes `usage.cost` once from flat model rates, so this extension rewrites the finalized assistant message's cost in `message_end` to match the billed rate.
+DeepSeek bills by time of day. Pi 1.1 lists direct DeepSeek and OpenRouter V4.1 Flash at peak rates; defaults use 1x during 01:00–04:00 and 06:00–10:00 UTC on weekdays and 0.5x outside. Other rate cards require explicit schedules. Correction remains an estimate: server arrival and Chinese public holidays are not modeled.
 
 ## Stack
 
@@ -18,7 +18,7 @@ No build step — pi loads the extension directly.
 
 ## Invariants
 
-- Rate selection uses the logical request start captured in `before_provider_request`, never `message_end`. The provider bills when the request arrives, and `message_start` only fires once the response begins, so a request spanning a window boundary would otherwise be billed on the wrong side of it.
+- Rate selection uses the assistant message timestamp, captured by Pi providers at invocation before HTTP dispatch. Do not use the global payload hook: cache warming replays it without foreground message events.
 - A message is scaled at most once, including the replacement returned to pi; retries re-deliver the same object.
 - The footer quotes the rate in force (input/output per million tokens) and names the direction: `▲ peak` above the recorded rate, `▼ off-peak` below it.
 - The footer follows the window it quotes. pi emits nothing while a session is idle, so a timer armed for the next instant the quoted rate changes re-renders it. It is armed only while a status is actually on screen, from the same clock reading as that status, and cleared in `session_shutdown`.

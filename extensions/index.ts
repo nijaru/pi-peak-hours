@@ -119,10 +119,10 @@ export interface ConfigFile extends ScheduleConfig {
 
 export const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
 
-/** DeepSeek's published schedule: peak mornings on UTC weekdays, everything else off-peak. */
+/** Stock Pi rates DeepSeek direct at peak; halve those rates outside its weekday windows. */
 export const DEFAULT_SCHEDULE: Schedule = {
-	multiplier: 2,
-	outside: 1,
+	multiplier: 1,
+	outside: 0.5,
 	windows: [
 		{ start: 60, end: 240 },
 		{ start: 360, end: 600 },
@@ -133,20 +133,20 @@ export const DEFAULT_SCHEDULE: Schedule = {
 };
 
 /**
- * The same model resold by OpenRouter, which pi's catalog rates at the off-peak
- * price while its own `deepseek` provider is rated at peak. Without this the
- * route silently keeps pi's flat rate.
+ * Pi 1.1 rates the current V4.1 Flash OpenRouter route at peak too. Other
+ * DeepSeek routes have different rate cards; require explicit schedules rather
+ * than applying this model's billing assumptions to every DeepSeek model.
  */
 export const OPENROUTER_SCHEDULE: Schedule = {
-	multiplier: 2,
-	outside: 1,
+	multiplier: 1,
+	outside: 0.5,
 	windows: [
 		{ start: 60, end: 240 },
 		{ start: 360, end: 600 },
 	],
 	days: [1, 2, 3, 4, 5],
 	providers: ["openrouter"],
-	models: ["deepseek/*"],
+	models: ["deepseek/deepseek-v4.1-flash"],
 };
 
 /** What a config that says nothing about schedules resolves to. */
@@ -470,7 +470,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Read the config file; undefined means missing or unreadable, which stays inert. */
+/** Missing or malformed config uses defaults; parsing failures are reported. */
 export function readConfig(path: string): ConfigFile | undefined {
 	if (!existsSync(path)) return {};
 	try {
@@ -490,7 +490,7 @@ export function readConfig(path: string): ConfigFile | undefined {
 /** Persist `active` while preserving keys this version does not model. */
 export function writeActive(path: string, active: boolean): void {
 	try {
-		const existing = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as unknown) : {};
+		const existing = readConfig(path) ?? {};
 		const merged = isRecord(existing) ? { ...existing, active } : { active };
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
@@ -551,8 +551,6 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	let schedules = resolveSchedules(config);
 	let active = parseActive(config.active);
 	const adjusted = adjustedMessages();
-	let pendingStart: number | undefined;
-	let requestStartMs: number | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	function refresh(): void {
@@ -635,8 +633,6 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		pendingStart = undefined;
-		requestStartMs = undefined;
 		disarm();
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
@@ -651,29 +647,16 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		updateStatus(ctx);
 	});
 
-	// The provider bills when the request arrives, and `message_start` is emitted
-	// only once the response begins, so capture the logical request start here and
-	// fall back to the message clock when no request was observed.
-	pi.on("before_provider_request", async () => {
-		if (active) requestStartMs = Date.now();
-	});
-
-	pi.on("message_start", async (event) => {
-		if (event.message.role !== "assistant") return;
-		pendingStart = requestStartMs ?? Date.now();
-		requestStartMs = undefined;
-	});
-
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message;
 		if (message.role !== "assistant") return;
 		if (adjusted.has(message)) return;
 		if (!message.usage?.cost) return;
 
-		// The request's start decides its rate; fall back to the message clock when
-		// no start was observed (resumed sessions, extension reloads mid-turn).
-		const startedAt = pendingStart ?? message.timestamp ?? Date.now();
-		pendingStart = undefined;
+		// Pi providers stamp their output at invocation, before HTTP dispatch.
+		// This clock belongs to the foreground response even when the global
+		// payload hook is replayed by background cache warming.
+		const startedAt = message.timestamp;
 
 		if (!active) {
 			updateStatus(ctx);

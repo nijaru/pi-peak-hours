@@ -7,12 +7,14 @@
  * it, because the instant a window turns over is the behavior under test.
  */
 
-import { describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { OPENROUTER_MODELS } from "@earendil-works/pi-ai/providers/openrouter.models";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import peakHours, {
@@ -24,6 +26,20 @@ import peakHours, {
 	STATUS_OFF_PEAK,
 	STATUS_PEAK,
 } from "../extensions/index.ts";
+
+test.each([DEEPSEEK_MODELS["deepseek-flash"], DEEPSEEK_MODELS["deepseek-v4-pro"], OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"]])("defaults match stock Pi pricing for $provider/$id", async model => {
+	const h = harness(configPath());
+	h.select(model);
+	for (const [hour, factor] of [["02", 1], ["05", 0.5]] as const) {
+		setSystemTime(new Date(`2026-09-15T${hour}:00:00Z`));
+		await h.emit("session_start");
+		const message = assistantMessage({ provider: model.provider, model: model.id, usage: { cost: { input: model.cost.input, output: model.cost.output, cacheRead: 0, cacheWrite: 0, total: model.cost.input + model.cost.output } } });
+		const replacement = await h.emit<{ message: AssistantMessage }>("message_end", { message });
+		const cost = (replacement?.message ?? message).usage.cost;
+		expect(cost.input).toBeCloseTo(model.cost.input * factor, 12);
+		expect(cost.output).toBeCloseTo(model.cost.output * factor, 12);
+	}
+});
 
 const RATES: RateCard = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
 const DEEPSEEK: ModelRate = { provider: "deepseek", id: "deepseek-flash", cost: RATES };
@@ -42,8 +58,18 @@ interface CommandOptions {
 	handler: (args: string, ctx: ExtensionContext) => Promise<void> | void;
 }
 
+const directories: string[] = [];
+const cleanups: Array<() => Promise<unknown>> = [];
+afterEach(async () => {
+	await Promise.all(cleanups.splice(0).map(cleanup => cleanup()));
+	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
+	setSystemTime();
+});
+
 function configPath(): string {
-	return join(mkdtempSync(join(tmpdir(), "pi-peak-hours-wiring-")), "pi-peak-hours.json");
+	const dir = mkdtempSync(join(tmpdir(), "pi-peak-hours-wiring-"));
+	directories.push(dir);
+	return join(dir, "pi-peak-hours.json");
 }
 
 function assistantMessage(overrides: { provider?: string; model?: string; usage?: Partial<AssistantMessage["usage"]> } = {}): AssistantMessage {
@@ -97,6 +123,7 @@ function harness(path: string, options: { hasUI?: boolean } = {}) {
 		},
 	} as unknown as ExtensionContext;
 
+	cleanups.push(async () => handlers.get("session_shutdown")?.({}, ctx));
 	return {
 		select(next?: ModelRate) {
 			model = next;
@@ -106,7 +133,7 @@ function harness(path: string, options: { hasUI?: boolean } = {}) {
 		status: () => statuses.at(-1),
 		async emit<T = unknown>(event: string, payload: Record<string, unknown> = {}): Promise<T | undefined> {
 			const handler = handlers.get(event);
-			if (!handler) throw new Error(`no handler registered for ${event}`);
+			if (!handler) return undefined;
 			return (await handler({ type: event, ...payload }, ctx)) as T | undefined;
 		},
 		async command(args: string) {
@@ -209,10 +236,10 @@ describe("peak hours handlers", () => {
 			// 2026-09-15 is a Tuesday. The request arrives before the window opens.
 			setSystemTime(new Date("2026-09-15T00:59:59Z"));
 			await h.emit("session_start");
-			await h.emit("before_provider_request");
-			// The response only begins after the window has opened.
+			const message = assistantMessage(); // provider invocation stamps this response
+			// A warming request starts after the foreground request, across the edge.
 			setSystemTime(new Date("2026-09-15T01:00:01Z"));
-			const message = assistantMessage();
+			await h.emit("before_provider_request");
 			await h.emit("message_start", { message });
 			const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
 			// Off-peak at the request start: no correction is applied.
@@ -317,20 +344,9 @@ describe("peak hours handlers", () => {
 		h.select(DEEPSEEK);
 		await h.emit("model_select", { model: DEEPSEEK });
 		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
-	});
-
-	test("re-evaluates at the start of each turn", async () => {
-		const path = configPath();
-		write(path, SURCHARGE);
-		const h = harness(path);
-		// The model was selected before the extension saw a session, as when a
-		// window boundary passes mid-session.
-		h.select(DEEPSEEK);
 		await h.emit("turn_start", { turnIndex: 3 });
-
 		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 	});
-
 	test("toggles from the command and persists the choice", async () => {
 		const path = configPath();
 		write(path, { ...SURCHARGE, active: true });
@@ -361,10 +377,12 @@ describe("peak hours handlers", () => {
 
 		const message = assistantMessage();
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
-		// The built-in DeepSeek schedule applies, so the rate is 1x or 2x depending
-		// on the wall clock; either way the handler must not throw or lose the cost.
+		// Malformed config uses stock-catalog defaults (1x peak, 0.5x off-peak).
 		const total = result?.message.usage.cost.total ?? message.usage.cost.total;
-		expect([0.75, 1.5]).toContain(Number(total.toFixed(6)));
+		expect([0.375, 0.75]).toContain(Number(total.toFixed(6)));
+		await h.command("off");
+		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(false);
+		expect(h.status()).toBeUndefined();
 	});
 
 	test("does nothing when the config turns correction off", async () => {

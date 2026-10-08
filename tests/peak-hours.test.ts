@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,7 +24,6 @@ import {
 	resolveSchedules,
 	scheduleFor,
 	STATUS_OFF_PEAK,
-	STATUS_PEAK,
 	statusIndicator,
 	writeActive,
 } from "../extensions/index.ts";
@@ -116,6 +115,8 @@ describe("resolveSchedules", () => {
 	test("defaults to DeepSeek direct plus the OpenRouter route for it", () => {
 		expect(resolveSchedules({})).toEqual(DEFAULT_SCHEDULES);
 		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4.1-flash")).toBeDefined();
+		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4.1-flash:batch")).toBeUndefined();
+		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4-flash")).toBeUndefined();
 	});
 
 	test("an explicit list replaces the default and does not inherit it", () => {
@@ -165,38 +166,20 @@ describe("resolveSchedules", () => {
 });
 
 describe("isPeakAt", () => {
-	test("matches DeepSeek's weekday windows in UTC", () => {
-		expect(isPeakAt(weekday(1), DEFAULT_SCHEDULE)).toBe(true);
-		expect(isPeakAt(weekday(3, 59), DEFAULT_SCHEDULE)).toBe(true);
-		expect(isPeakAt(weekday(6), DEFAULT_SCHEDULE)).toBe(true);
-		expect(isPeakAt(weekday(9, 59), DEFAULT_SCHEDULE)).toBe(true);
-	});
-
-	test("treats window edges as start-inclusive and end-exclusive", () => {
-		expect(isPeakAt(weekday(4), DEFAULT_SCHEDULE)).toBe(false);
-		expect(isPeakAt(weekday(5, 59), DEFAULT_SCHEDULE)).toBe(false);
-		expect(isPeakAt(weekday(10), DEFAULT_SCHEDULE)).toBe(false);
-	});
-
-	test("is off-peak all weekend, including inside a window", () => {
-		expect(isPeakAt(saturday(2), DEFAULT_SCHEDULE)).toBe(false);
-		expect(isPeakAt(saturday(9), DEFAULT_SCHEDULE)).toBe(false);
+	test.each([[weekday(1), 2], [weekday(3, 59), 2], [weekday(4), 1], [weekday(5, 59), 1], [weekday(6), 2], [weekday(9, 59), 2], [weekday(10), 1], [saturday(2), 1], [saturday(9), 1]] as const)("honors weekday windows and inclusive/exclusive edges at %s", (date, multiplier) => {
+		const schedule = resolveSchedule({ multiplier: 2, outside: 1 });
+		expect(multiplierAt(date, schedule)).toBe(multiplier);
+		expect(isPeakAt(date, schedule)).toBe(multiplier > 1);
 	});
 
 	test("supports windows that cross midnight", () => {
-		const schedule = resolveSchedule({ windows: [["23:00", "02:00"]], days: ["fri"] });
+		const schedule = resolveSchedule({ windows: [["23:00", "02:00"]], days: ["fri"], multiplier: 2, outside: 1 });
 		expect(isPeakAt(new Date(Date.UTC(2026, 8, 11, 23, 30)), schedule)).toBe(true);
 		// The tail belongs to Friday's window, even though it lands on Saturday.
 		expect(isPeakAt(new Date(Date.UTC(2026, 8, 12, 1, 0)), schedule)).toBe(true);
 		expect(isPeakAt(new Date(Date.UTC(2026, 8, 12, 3, 0)), schedule)).toBe(false);
 		// Monday 23:30 is not Friday, so it never opens a window.
 		expect(isPeakAt(new Date(Date.UTC(2026, 8, 14, 23, 30)), schedule)).toBe(false);
-	});
-
-	test("charges the listed multiplier only while peak", () => {
-		expect(multiplierAt(weekday(2), DEFAULT_SCHEDULE)).toBe(2);
-		expect(multiplierAt(weekday(5), DEFAULT_SCHEDULE)).toBe(1);
-		expect(multiplierAt(saturday(2), DEFAULT_SCHEDULE)).toBe(1);
 	});
 });
 
@@ -318,10 +301,6 @@ describe("applyMultiplier", () => {
 		expect(scaled.total).toBeCloseTo(0.753, 12);
 	});
 
-	test("is a no-op at 1x", () => {
-		const cost = { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 };
-		expect(applyMultiplier(cost, 1)).toEqual(cost);
-	});
 });
 
 describe("parseActive", () => {
@@ -366,15 +345,15 @@ describe("schedule matching", () => {
 });
 
 describe("statusIndicator", () => {
-	// pi's off-peak base for DeepSeek direct, as this user's models.json sets it.
-	const cost = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
+	// Pi 1.1 records the current direct model at its published peak rate.
+	const cost = { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 };
 	const deepseek = { provider: "deepseek", id: "deepseek-flash", cost };
 	const other = { provider: "openai-codex", id: "gpt-6-astra", cost };
 
 	test("quotes the rate in force, prefixed when it differs from the recorded one", () => {
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe(`· ${STATUS_PEAK} $0.3/$1.2/M`);
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe("· $0.15/$0.6/M");
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe("· $0.15/$0.6/M");
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe("· $0.3/$1.2/M");
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
 	});
 
 	test("stays hidden for models no schedule covers", () => {
@@ -392,7 +371,7 @@ describe("statusIndicator", () => {
 		const schedules = [resolveSchedule({ providers: ["openrouter"], models: ["deepseek/*"] })];
 		const routed = { provider: "openrouter", id: "deepseek/v4", cost };
 
-		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe(`· ${STATUS_PEAK} $0.3/$1.2/M`);
+		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe("· $0.3/$1.2/M");
 		expect(statusIndicator(schedules, true, deepseek, weekday(2))).toBeUndefined();
 	});
 
@@ -430,14 +409,24 @@ describe("describeRate", () => {
 	});
 });
 
+const directories: string[] = [];
+afterEach(() => {
+	for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+function temporaryDirectory(): string {
+	const dir = mkdtempSync(join(tmpdir(), "pi-peak-hours-"));
+	directories.push(dir);
+	return dir;
+}
+
 describe("config files", () => {
 	test("a missing file resolves to defaults, not a failure", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-peak-hours-"));
+		const dir = temporaryDirectory();
 		expect(readConfig(join(dir, "absent.json"))).toEqual({});
 	});
 
 	test("an unparseable file warns and resolves to defaults", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-peak-hours-"));
+		const dir = temporaryDirectory();
 		const path = join(dir, "broken.json");
 		writeFileSync(path, "{not json", "utf8");
 		expect(readConfig(path)).toEqual({});
@@ -445,7 +434,7 @@ describe("config files", () => {
 	});
 
 	test("writing the toggle preserves keys this version does not model", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-peak-hours-"));
+		const dir = temporaryDirectory();
 		const path = join(dir, "pi-peak-hours.json");
 		writeFileSync(path, `${JSON.stringify({ active: true, multiplier: 3, future: { keep: true } })}\n`, "utf8");
 
