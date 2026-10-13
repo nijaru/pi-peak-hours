@@ -15,6 +15,7 @@ import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { OPENROUTER_MODELS } from "@earendil-works/pi-ai/providers/openrouter.models";
+import { XIAOMI_MODELS } from "@earendil-works/pi-ai/providers/xiaomi.models";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import peakHours, {
@@ -27,18 +28,72 @@ import peakHours, {
 	STATUS_PEAK,
 } from "../extensions/index.ts";
 
-test.each([DEEPSEEK_MODELS["deepseek-flash"], DEEPSEEK_MODELS["deepseek-v4-pro"], OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"]])("defaults match stock Pi pricing for $provider/$id", async model => {
+// Published direct rate cards: https://api-docs.deepseek.com/quick_start/pricing
+test.each([
+	{ model: DEEPSEEK_MODELS["deepseek-flash"], peak: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 } },
+	{ model: DEEPSEEK_MODELS["deepseek-v4-pro"], peak: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 } },
+])("defaults match published direct prices for $model.id", async ({ model, peak }) => {
+	expect(model.cost).toEqual(peak);
 	const h = harness(configPath());
 	h.select(model);
 	for (const [hour, factor] of [["02", 1], ["05", 0.5]] as const) {
 		setSystemTime(new Date(`2026-09-15T${hour}:00:00Z`));
 		await h.emit("session_start");
-		const message = assistantMessage({ provider: model.provider, model: model.id, usage: { cost: { input: model.cost.input, output: model.cost.output, cacheRead: 0, cacheWrite: 0, total: model.cost.input + model.cost.output } } });
+		const message = assistantMessage({
+			model: model.id,
+			usage: { cacheRead: 1_000_000, totalTokens: 3_000_000, cost: { ...model.cost, total: model.cost.input + model.cost.output + model.cost.cacheRead } },
+		});
 		const replacement = await h.emit<{ message: AssistantMessage }>("message_end", { message });
-		const cost = (replacement?.message ?? message).usage.cost;
-		expect(cost.input).toBeCloseTo(model.cost.input * factor, 12);
-		expect(cost.output).toBeCloseTo(model.cost.output * factor, 12);
+		const usage = (replacement?.message ?? message).usage;
+		expect(usage.cost).toEqual({
+			input: peak.input * factor,
+			output: peak.output * factor,
+			cacheRead: peak.cacheRead * factor,
+			cacheWrite: 0,
+			total: (peak.input + peak.output + peak.cacheRead) * factor,
+		});
+		expect(usage.input).toBe(1_000_000);
+		expect(usage.output).toBe(1_000_000);
+		expect(usage.cacheRead).toBe(1_000_000);
+		expect(usage.totalTokens).toBe(3_000_000);
 	}
+});
+
+test.each([
+	OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"],
+	// Pi 1.2 can personalize the catalog with /models/user prices. Never infer
+	// this reseller's bill from direct DeepSeek's schedule or bundled prices.
+	{ ...OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"], cost: { input: 0.045, output: 0.891, cacheRead: 0.0054, cacheWrite: 0 } },
+	XIAOMI_MODELS["mimo-v2.6-pro"],
+])("defaults leave reseller and ordinary API prices untouched for $provider/$id", async model => {
+	const h = harness(configPath());
+	h.select(model);
+	for (const hour of ["02", "05", "17"]) {
+		setSystemTime(new Date(`2026-09-15T${hour}:00:00Z`));
+		await h.emit("session_start");
+		const message = assistantMessage({
+			provider: model.provider,
+			model: model.id,
+			usage: { cost: { ...model.cost, total: model.cost.input + model.cost.output + model.cost.cacheRead } },
+		});
+		const original = structuredClone(message);
+		expect(await h.emit("message_end", { message })).toBeUndefined();
+		expect(message).toEqual(original);
+		expect(h.status()).toBeUndefined();
+	}
+});
+
+test("an explicit reseller schedule still corrects costs", async () => {
+	const path = configPath();
+	write(path, { schedules: [{ providers: ["openrouter"], models: ["deepseek/deepseek-v4.1-flash"], outside: 0.8 }] });
+	const h = harness(path);
+	const model = OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"];
+	h.select(model);
+	await h.emit("session_start");
+	const message = assistantMessage({ provider: model.provider, model: model.id });
+	const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
+	expect(result?.message.usage.cost.total).toBeCloseTo(0.6, 12);
+	expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.12/$0.48${RATE_UNIT}`);
 });
 
 const RATES: RateCard = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };

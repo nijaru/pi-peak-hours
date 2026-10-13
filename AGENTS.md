@@ -2,7 +2,7 @@
 
 Correct pi's recorded cost for providers that charge more during peak hours, and show the multiplier in the footer status.
 
-DeepSeek bills by time of day. Pi 1.1 lists direct DeepSeek and OpenRouter V4.1 Flash at peak rates; defaults use 1x during 01:00–04:00 and 06:00–10:00 UTC on weekdays and 0.5x outside. Other rate cards require explicit schedules. Correction remains an estimate: server arrival and Chinese public holidays are not modeled.
+DeepSeek bills by time of day. Pi 1.2 lists direct DeepSeek at peak rates; the default covers it alone (1x during 01:00–04:00 and 06:00–10:00 UTC on weekdays, 0.5x outside). OpenRouter and other reseller routes price per key at flat rates with no time-of-day billing, so no default covers them; other rate cards require explicit schedules. Correction remains an estimate: server arrival and Chinese public holidays are not modeled.
 
 ## Stack
 

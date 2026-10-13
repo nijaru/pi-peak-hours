@@ -4,7 +4,7 @@ Correct pi's recorded cost for providers that bill by time of day, and show the 
 
 DeepSeek is the current example. Its peak windows are `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, and off-peak is half the peak rate. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session is over- or understated by up to 2x depending on which side of the schedule the recorded rate sits.
 
-The defaults match Pi 1.1’s catalog: DeepSeek direct and `openrouter/deepseek/deepseek-v4.1-flash` use **peak** base rates, so correction is ×1 inside the windows and ×0.5 outside. Other OpenRouter DeepSeek models have different rate cards and need explicit schedules; a blanket `deepseek/*` rule would misprice them. Custom `models.json` rates also need matching multipliers.
+The default covers DeepSeek direct only: pi records it at the published **peak** rate, so correction is ×1 inside the windows and ×0.5 outside. Reseller routes bill flat — OpenRouter prices each model per key and publishes no time-of-day overrides — so a default multiplier would corrupt their cost instead of correcting it. Give a route an explicit schedule only when its provider really bills by time of day. Custom `models.json` rates also need matching multipliers.
 
 This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. The status line quotes the rate in force for the selected model — `· ▲ peak $0.30/$1.20/M` during a peak window, `· $0.15/$0.60/M` off it — with `▲ peak` or `▼ off-peak` added when the hour costs more or less than the rate pi recorded. With stock peak-base prices, the peak indicator is absent and off-peak is marked as a discount. `/peak-hours status` names the schedule behind it.
 
@@ -29,7 +29,7 @@ The footer status is a separate line under the stats bar. It shows the model's c
 
 ## Configuration
 
-Optional. `~/.pi/agent/extensions/pi-peak-hours.json` overlays the DeepSeek schedule; anything you leave out keeps its default. The OpenRouter V4.1 Flash route is covered out of the box, and setting `providers` yourself replaces both built-in schedules with the one you describe.
+Optional. `~/.pi/agent/extensions/pi-peak-hours.json` overlays the DeepSeek schedule; anything you leave out keeps its default. A `schedules` list replaces the default outright instead of overlaying it.
 
 ```json
 {
@@ -51,7 +51,7 @@ Times are **UTC**. `days` accepts names or `0`–`6` (`0` is Sunday). `providers
 "windows": [{ "start": "22:00", "end": "08:00", "multiplier": 0.4 }]
 ```
 
-**Pick the side that matches your own rate card.** The extension applies the difference from the rate pi recorded; it does not guess which side that is. The built-in pair encodes today's pi.dev catalog — DeepSeek direct and OpenRouter V4.1 Flash at their **peak** rates — and if your catalog changes, or you override rates in `models.json` as below, say so in the config instead of relying on the default. `/peak-hours status` reports what it would charge right now, and the numbers are in the provider's docs.
+**Pick the side that matches your own rate card.** The extension applies the difference from the rate pi recorded; it does not guess which side that is. The built-in schedule encodes today's pi.dev catalog — DeepSeek direct at its **peak** rate — and if your catalog changes, or you override rates in `models.json` as below, say so in the config instead of relying on the default. `/peak-hours status` reports what it would charge right now, and the numbers are in the provider's docs.
 
 ```json
 // Your models.json pins DeepSeek direct to the off-peak rate: scale up at peak.
@@ -63,7 +63,7 @@ Times are **UTC**. `days` accepts names or `0`–`6` (`0` is Sunday). `providers
 
 ### Other providers
 
-A `schedules` list replaces the built-in schedules with one entry per service. Each entry starts from a clean slate rather than inheriting DeepSeek's windows.
+A `schedules` list replaces the built-in schedule with one entry per service. Each entry starts from a clean slate rather than inheriting DeepSeek's windows.
 
 **Z.ai coding plan** — the standard credit rate during the weekday peak window, half of it everywhere else (docs.z.ai/devpack). This is inverted relative to DeepSeek: `06:00–10:00` UTC Monday–Friday is the *expensive* side, so the windows match and the multiplier lands below 1.
 
@@ -91,6 +91,8 @@ Note that a coding plan is billed in credits against a subscription, so pi's cos
   ]
 }
 ```
+
+**Xiaomi MiMo Token Plan** — subscription credits rather than the pay-as-you-go API (which is flat-rate): the night rate consumes 0.8× credits from 00:00–08:00 Beijing (16:00–24:00 UTC) daily ([docs](https://mimo.mi.com/static/docs/price/token-plan.md)), as a `schedules` entry: `{ "providers": ["xiaomi-token-plan-*"], "windows": [["16:00", "00:00"]], "multiplier": 0.8, "outside": 1 }`.
 
 OpenRouter publishes the same windows machine-readably for models it hosts (`pricing.overrides` with `utc_days` / `utc_start` / `utc_end` on `https://openrouter.ai/api/v1/models`), but this extension reads its schedule from config rather than the network: the correction is a rate difference, not a price lookup, and a fetch would add a failure mode to a handler that must never throw.
 

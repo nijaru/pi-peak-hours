@@ -15,22 +15,22 @@
  * HTML export without further plumbing.
  *
  * The footer indicator is scoped to the selected model and quotes the rate that
- * applies to it right now, in dollars per million tokens: `· ▲ peak
- * $0.30/$1.20/M` at peak, `· $0.15/$0.60/M` off it. The rate is the one pi
- * recorded scaled by the schedule, so it always agrees with the cost this
- * extension writes. A session on a provider or model no schedule covers never
- * shows a rate, and switching models re-evaluates it.
+ * applies to it right now, in dollars per million tokens: with the default
+ * schedule, `· $0.30/$1.20/M` at peak and `· ▼ off-peak $0.15/$0.60/M` off it.
+ * The rate is the one pi recorded scaled by the schedule, so it always agrees
+ * with the cost this extension writes. A session on a provider or model no
+ * schedule covers never shows a rate, and switching models re-evaluates it.
  *
  * The indicator is a snapshot of the current hour, and pi fires no event while a
  * session sits idle — so a timer armed at the next window boundary keeps it from
  * quoting a rate that has already expired. See `arm`.
  *
- * Schedules are provider-scoped and there can be several, because the shape of
- * the correction differs: DeepSeek's list price is its off-peak rate, so peak is
- * a surcharge (×2), while Z.ai's coding plan and Alibaba's night discount are
- * priced the other way round and land below the recorded rate. A multiplier
- * above 1 reads as `peak`, below 1 as `off-peak`, and the footer names the
- * direction so a discount is never reported as a peak.
+ * Schedules are provider-scoped and there can be several, because the recorded
+ * rate sits on a different side of each: pi records DeepSeek direct at its peak
+ * rate, so off-peak is a discount (×0.5), while a catalog pinned at the off-peak
+ * number would make peak a surcharge (×2). A multiplier above 1 reads as `peak`,
+ * below 1 as `off-peak`, and the footer names the direction so a discount is
+ * never reported as a peak.
  *
  * Design constraints:
  *
@@ -40,10 +40,11 @@
  *   the start; `message_end` gives the end.
  * - A schedule declares the multiplier INSIDE its windows and `outside` for
  *   every other hour. Which side pi's recorded rate sits on is not assumed:
- *   encode it in the config, and only the difference is applied. pi's own
- *   catalog disagrees with itself here — it lists DeepSeek direct at peak rates
- *   and the same model through OpenRouter at off-peak rates — so a schedule that
- *   guesses would double-charge one of them.
+ *   encode it in the config, and only the difference is applied. Only DeepSeek
+ *   direct has a built-in schedule: reseller routes are priced per key at flat
+ *   rates with no time-of-day billing (OpenRouter's DeepSeek routes publish no
+ *   `pricing.overrides`), so a default multiplier would corrupt their cost
+ *   instead of correcting it.
  * - A message is never scaled twice. Retries and overflow recovery can deliver
  *   the same message object again, so adjustments are guarded by identity.
  * - Only the four cost fields are touched, and `total` is recomputed from
@@ -131,26 +132,6 @@ export const DEFAULT_SCHEDULE: Schedule = {
 	providers: ["deepseek"],
 	models: ["*"],
 };
-
-/**
- * Pi 1.1 rates the current V4.1 Flash OpenRouter route at peak too. Other
- * DeepSeek routes have different rate cards; require explicit schedules rather
- * than applying this model's billing assumptions to every DeepSeek model.
- */
-export const OPENROUTER_SCHEDULE: Schedule = {
-	multiplier: 1,
-	outside: 0.5,
-	windows: [
-		{ start: 60, end: 240 },
-		{ start: 360, end: 600 },
-	],
-	days: [1, 2, 3, 4, 5],
-	providers: ["openrouter"],
-	models: ["deepseek/deepseek-v4.1-flash"],
-};
-
-/** What a config that says nothing about schedules resolves to. */
-export const DEFAULT_SCHEDULES: Schedule[] = [DEFAULT_SCHEDULE, OPENROUTER_SCHEDULE];
 
 /**
  * Base for schedules listed explicitly in `schedules`: no windows, no
@@ -261,16 +242,14 @@ function parseDays(value: unknown): number[] | undefined {
 
 /**
  * Every schedule the config describes. An explicit `schedules` list replaces the
- * built-in schedules; a flat config overlays the DeepSeek one and drops the
- * built-in OpenRouter route once it names its own providers.
+ * default outright; a flat config overlays the DeepSeek one.
  */
 export function resolveSchedules(config: ConfigFile): Schedule[] {
 	if (Array.isArray(config.schedules)) {
 		const entries = config.schedules.filter(isRecord).map((entry) => resolveSchedule(entry, NEUTRAL_SCHEDULE));
 		if (entries.length > 0) return entries;
 	}
-	const schedule = resolveSchedule(config);
-	return config.providers === undefined ? [schedule, OPENROUTER_SCHEDULE] : [schedule];
+	return [resolveSchedule(config)];
 }
 
 /** Whether a window covers the given instant, including windows that wrap midnight. */

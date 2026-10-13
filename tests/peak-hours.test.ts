@@ -7,7 +7,6 @@ import {
 	applyMultiplier,
 	DEFAULT_ACTIVE,
 	DEFAULT_SCHEDULE,
-	DEFAULT_SCHEDULES,
 	describeRate,
 	isPeakAt,
 	matchesPattern,
@@ -112,11 +111,13 @@ describe("resolveSchedule", () => {
 });
 
 describe("resolveSchedules", () => {
-	test("defaults to DeepSeek direct plus the OpenRouter route for it", () => {
-		expect(resolveSchedules({})).toEqual(DEFAULT_SCHEDULES);
-		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4.1-flash")).toBeDefined();
-		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4.1-flash:batch")).toBeUndefined();
-		expect(scheduleFor(DEFAULT_SCHEDULES, "openrouter", "deepseek/deepseek-v4-flash")).toBeUndefined();
+	test("defaults cover only direct DeepSeek", () => {
+		const defaults = resolveSchedules({});
+		expect(defaults).toEqual([DEFAULT_SCHEDULE]);
+		expect(scheduleFor(defaults, "deepseek", "deepseek-flash")).toBeDefined();
+		expect(scheduleFor(defaults, "openrouter", "deepseek/deepseek-v4.1-flash")).toBeUndefined();
+		expect(scheduleFor(defaults, "openrouter", "deepseek/deepseek-v4.1-flash:batch")).toBeUndefined();
+		expect(scheduleFor(defaults, "openrouter", "deepseek/deepseek-v4-flash")).toBeUndefined();
 	});
 
 	test("an explicit list replaces the default and does not inherit it", () => {
@@ -129,7 +130,7 @@ describe("resolveSchedules", () => {
 		expect(zai?.windows).toEqual([]);
 	});
 
-	test("a flat config that names providers drops the built-in OpenRouter route", () => {
+	test("a flat config overlays the direct schedule", () => {
 		const schedules = resolveSchedules({ providers: ["deepseek"], multiplier: 3 });
 
 		expect(schedules).toHaveLength(1);
@@ -138,8 +139,8 @@ describe("resolveSchedules", () => {
 	});
 
 	test("an empty or malformed list falls back to the flat config", () => {
-		expect(resolveSchedules({ schedules: [] })).toEqual(DEFAULT_SCHEDULES);
-		expect(resolveSchedules({ schedules: ["nope"] as never })).toEqual(DEFAULT_SCHEDULES);
+		expect(resolveSchedules({ schedules: [] })).toEqual([DEFAULT_SCHEDULE]);
+		expect(resolveSchedules({ schedules: ["nope"] as never })).toEqual([DEFAULT_SCHEDULE]);
 	});
 
 	test("a resolved schedule does not alias the exported defaults", () => {
@@ -345,7 +346,7 @@ describe("schedule matching", () => {
 });
 
 describe("statusIndicator", () => {
-	// Pi 1.1 records the current direct model at its published peak rate.
+	// Pi 1.2 records the current direct model at its published peak rate.
 	const cost = { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 };
 	const deepseek = { provider: "deepseek", id: "deepseek-flash", cost };
 	const other = { provider: "openai-codex", id: "gpt-6-astra", cost };
