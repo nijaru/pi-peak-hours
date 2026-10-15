@@ -87,7 +87,8 @@ test("an explicit reseller schedule still corrects costs", async () => {
 	const path = configPath();
 	write(path, { schedules: [{ providers: ["openrouter"], models: ["deepseek/deepseek-v4.1-flash"], outside: 0.8 }] });
 	const h = harness(path);
-	const model = OPENROUTER_MODELS["deepseek/deepseek-v4.1-flash"];
+	// Explicit account rates keep this schedule test independent of catalog price changes.
+	const model: ModelRate = { provider: "openrouter", id: "deepseek/deepseek-v4.1-flash", cost: RATES };
 	h.select(model);
 	await h.emit("session_start");
 	const message = assistantMessage({ provider: model.provider, model: model.id });
