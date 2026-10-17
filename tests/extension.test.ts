@@ -28,6 +28,18 @@ import peakHours, {
 	STATUS_PEAK,
 } from "../extensions/index.ts";
 
+test("describes a schedule with no windows as the outside rate all day", async () => {
+	const path = configPath();
+	writeFileSync(path, JSON.stringify({
+		schedules: [{ windows: [], outside: 0.5, days: ["mon"], providers: ["fixture"], models: ["*"], multiplier: 1 }],
+	}));
+	const h = harness(path);
+	h.select({ provider: "fixture", id: "fixture", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } });
+	await h.command("status");
+	expect(h.notes.at(-1)).toContain("×0.5 always");
+	expect(h.notes.at(-1)).not.toContain("×1 always");
+});
+
 // Published direct rate cards: https://api-docs.deepseek.com/quick_start/pricing
 test.each([
 	{ model: DEEPSEEK_MODELS["deepseek-flash"], peak: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 } },

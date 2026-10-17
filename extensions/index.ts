@@ -491,8 +491,9 @@ function describeSchedule(schedule: Schedule): string {
 		})
 		.join(", ");
 	const days = schedule.days.map((day) => DAY_NAMES[day]).join(",");
-	const inside = windows ? `×${schedule.multiplier} in ${windows}` : `×${schedule.multiplier} always`;
-	return `${inside}, ×${schedule.outside} outside (${days} UTC) for ${schedule.providers.join(",")}`;
+	// With no windows, `outside` is the rate all day; there is no "inside".
+	if (windows === "") return `×${schedule.outside} always (${days} UTC) for ${schedule.providers.join(",")}`;
+	return `×${schedule.multiplier} in ${windows}, ×${schedule.outside} outside (${days} UTC) for ${schedule.providers.join(",")}`;
 }
 
 function describeAll(schedules: Schedule[]): string {
