@@ -331,9 +331,9 @@ describe("statusIndicator", () => {
 	const other = { provider: "openai-codex", id: "gpt-6-astra", cost };
 
 	test("quotes the rate in force, prefixed when it differs from the recorded one", () => {
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe("· $0.3/$1.2/M");
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe("· est. $0.3/$1.2/M");
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe(`· est. ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
 	});
 
 	test("stays hidden for models no schedule covers", () => {
@@ -351,7 +351,7 @@ describe("statusIndicator", () => {
 		const schedules = [resolveSchedule({ providers: ["openrouter"], models: ["deepseek/*"] })];
 		const routed = { provider: "openrouter", id: "deepseek/v4", cost };
 
-		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe("· $0.3/$1.2/M");
+		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe("· est. $0.3/$1.2/M");
 		expect(statusIndicator(schedules, true, deepseek, weekday(2))).toBeUndefined();
 	});
 
@@ -363,9 +363,9 @@ describe("statusIndicator", () => {
 
 		// 07:00 UTC is the window where the standard rate applies, so the rate is the
 		// recorded one and only the price is shown.
-		expect(statusIndicator(schedules, true, zai, weekday(7))).toBe("· $1.4/$4.4/M");
-		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
-		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+		expect(statusIndicator(schedules, true, zai, weekday(7))).toBe("· est. $1.4/$4.4/M");
+		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
 	});
 });
 

@@ -1,14 +1,16 @@
 # pi-peak-hours
 
-Correct pi's recorded cost for providers that bill by time of day, and show the rate in force in the footer.
+Estimate time-of-day pricing from pi's recorded cost, and show the current estimated rate in the footer.
 
 DeepSeek is the current example. Its peak windows are `01:00–04:00` and `06:00–10:00` UTC, Monday to Friday, and off-peak is half the peak rate. pi has no notion of time-of-day pricing: `usage.cost` is computed once from the model's flat rates when usage is finalized, so a session is over- or understated by up to 2x depending on which side of the schedule the recorded rate sits.
 
 The default covers DeepSeek direct only: pi records it at the published **peak** rate, so correction is ×1 inside the windows and ×0.5 outside. Reseller routes bill flat — OpenRouter prices each model per key and publishes no time-of-day overrides — so a default multiplier would corrupt their cost instead of correcting it. Give a route an explicit schedule only when its provider really bills by time of day. Custom `models.json` rates also need matching multipliers.
 
-This extension rewrites `usage.cost` on the finalized assistant message, so the footer total, the per-model breakdown, and the HTML export all reflect the billed rate. The status line quotes the rate in force for the selected model — `· $0.30/$1.20/M` during a peak window, `· ▼ off-peak $0.15/$0.60/M` off it — with `▲ peak` or `▼ off-peak` added when the hour costs more or less than the rate pi recorded. With stock peak-base prices, the peak indicator is absent and off-peak is marked as a discount. `/peak-hours status` names the schedule behind it.
+With a compatible [pi-provider-compaction](https://github.com/nijaru/pi-provider-compaction) companion loaded, this extension scales existing `usage.cost` before request completion reaches stream consumers or cache observers. It covers observed foreground requests, compaction, branch summaries, and cache warming for scheduled providers. Without the companion, it still corrects finalized foreground assistant messages through `message_end`; auxiliary usage stays unchanged. Both paths preserve token counts and existing cost corrections such as `/fast`.
 
-The quoted rate is pi's recorded rate scaled by the schedule, so it always agrees with the cost written to the session. It describes the hour in force rather than a particular request, though: a request that started before a boundary is billed by its start time while the footer has already moved to the new hour. Where pi's rate table is stale or wrong for your route, the quoted rate is stale in the same way — the extension corrects the shape of the bill, not the base rate.
+The status line quotes the selected model's scheduled catalog estimate — `· est. $0.30/$1.20/M` during a peak window, `· est. ▼ off-peak $0.15/$0.60/M` off it. `▲ peak` or `▼ off-peak` marks a rate above or below pi's recorded rate. With stock peak-base prices, peak has no indicator and off-peak is marked as a discount. `/peak-hours status` names the schedule.
+
+The footer describes the current hour, not a particular request: a request invoked before a boundary uses its invocation timestamp even after the footer moves to the new hour. Request-specific corrections can also differ from the quoted catalog rate. Stale base prices remain stale; this extension applies a multiplier, not a price lookup. All costs are estimates, not invoices: server arrival times and Chinese public holidays are not modeled.
 
 ## Install
 
@@ -16,7 +18,9 @@ The quoted rate is pi's recorded rate scaled by the schedule, so it always agree
 pi install npm:@nijaru/pi-peak-hours
 ```
 
-Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine install.
+For a manual install, copy both files from `extensions/` into `~/.pi/agent/extensions/peak-hours/`, keeping `index.ts` and `request-pricing.ts` together.
+
+Request-wide pricing requires a companion version that supports the `pi-provider-compaction:observe-usage` event. Older or absent companions leave foreground correction usable; no second provider wrapper is installed.
 
 ## Usage
 
@@ -24,6 +28,8 @@ Or copy `extensions/index.ts` to `~/.pi/agent/extensions/` for a single-machine 
 /peak-hours           # show the effective schedule and the current rate
 /peak-hours on|off    # toggle correction; persists to pi-peak-hours.json
 ```
+
+`/peak-hours status` also reloads the configuration. With the companion, configuration and on/off changes apply to new requests; requests already dispatched keep their sampled decision.
 
 The footer status is a separate line under the stats bar. It shows the model's current rate while a schedule covers it, and clears when correction is off, no schedule applies, or pi records no cost for the model. It re-evaluates on model switch, on every turn, and when a message is finalized — and it arms a timer for the next instant the rate it quotes actually changes, so a session sitting idle across 04:00 UTC flips to the new rate on time instead of at its next turn.
 
@@ -100,16 +106,17 @@ A malformed field falls back to its default rather than disabling the extension;
 
 ## Design notes
 
-- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer never shows a rate for a service that does not bill by time of day. A rate above the recorded one reads `peak`, below it `off-peak`, and a discount is never labelled a peak. The quoted rate and the written cost come from the same multiplication, so they cannot disagree.
+- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer shows no rate for uncovered models. A rate above the recorded one reads `peak`, below it `off-peak`. The `est.` label applies even with request-wide coverage.
 - **The footer follows the window it quotes.** pi has no render tick and fires no event while a session is idle, and a rate that changes at 04:00 would otherwise stay on screen until the next turn. The extension arms a single timer for the next instant the quoted rate changes and re-arms it after each fire, from the same clock reading as the status it is keeping fresh. It arms nothing when there is no status on screen, and the timer is unreferenced and cleared on session shutdown, so it neither holds pi open nor outlives its session.
-- **Rate by provider invocation.** Pi providers timestamp each assistant message before preparing and sending its HTTP request. That timestamp selects the multiplier, not response completion or the shared payload hook (which also fires for background cache warming). Server arrival can differ across a boundary, so this remains an estimate.
-- **Scaled once.** Retries and overflow recovery can re-deliver the same message object, so adjustments are guarded by identity; the replacement returned to pi is registered too, so a replayed replacement cannot be scaled twice.
+- **Rate by provider invocation.** Pi providers timestamp each assistant message before preparing and sending its HTTP request. That timestamp selects the multiplier, not completion time or the shared payload hook. With the companion, active state and schedules are captured at request dispatch; without it, foreground fallback uses the configuration at `message_end`.
+- **Scaled once.** Global weak identity guards protect usage and foreground message objects across loaded copies, retries, and returned replacements. Usage observed at dispatch remains handled even when its decision is unchanged (×1 or inactive), so fallback cannot overwrite it after a config change.
+- **Shared ownership.** The client requests usage-only leases for covered available models and the current model, deduplicated by provider. The companion scopes callbacks to the owning session. Retired leases are reacquired on reconciliation; shutdown and SDK disposal remove only this client's leases. Neither catalogs nor unrelated provider slots are replaced.
 - **Only cost moves.** The four cost fields are scaled and `total` is recomputed from them, matching pi's own invariant. Token counts are untouched, so rate-from-cost derivations stay self-consistent — including pi's cache-miss accounting, which derives its paid and read rates from the same message and scales with it.
-- **Coverage.** The default weekday schedule does not encode Chinese public holidays, which DeepSeek treats as off-peak. Holiday costs can therefore be overstated; totals are not an invoice. Assistant messages carry the bulk of a session's spend. Compaction and branch-summary usage, prompt-cache-warming refreshes, and token usage reported by tools also consume budget but cannot be adjusted after the fact, so totals stay an estimate rather than an invoice.
+- **Coverage.** Only requests observed by the companion's safe dispatcher receive request-wide correction. Unavailable models, unsupported provider registrations, and usage reported independently by tools can remain uncorrected. Without the companion, coverage is foreground assistant messages only. The default weekday schedule does not encode Chinese public holidays, which DeepSeek treats as off-peak; holiday costs can therefore be overstated.
 
 ## Stack
 
-TypeScript, Bun. Pi extension API (`@earendil-works/pi-coding-agent`). `@earendil-works/pi-ai` is a dev dependency only — the handlers use pi's own `Model` and usage shapes structurally, so nothing from it ships. No build step — pi loads the extension directly.
+TypeScript, Bun. `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` are host-provided peers; the latter supplies session-resource cleanup for SDK disposal. No build step — pi loads `extensions/index.ts` directly.
 
 ## Testing
 

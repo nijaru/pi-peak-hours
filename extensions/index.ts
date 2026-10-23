@@ -1,5 +1,5 @@
 /**
- * pi-peak-hours — correct recorded cost for providers that bill by time of day.
+ * pi-peak-hours — estimate time-of-day cost from pi's existing recorded cost.
  *
  * DeepSeek is the clearest example: a 2x multiplier applies during peak windows
  * (01:00-04:00 and 06:00-10:00 UTC, Monday-Friday, as of September 2026) and the
@@ -8,18 +8,17 @@
  * finalized — so a session is over- or understated by up to 2x, in whichever
  * direction the recorded rate sits from the billed one.
  *
- * This extension rewrites `usage.cost` on the finalized assistant message in
- * `message_end`, the documented hook for replacing a message. The footer
- * recomputes session totals from persisted entries on every render, so the
- * corrected number appears in the footer, the per-model breakdown, and the
- * HTML export without further plumbing.
+ * With pi-provider-compaction, usage-only leases correct request usage before
+ * stream consumers and cache observers see it. Without the companion, the
+ * documented `message_end` replacement hook still corrects foreground messages.
+ * Neither path changes catalogs, tokens, or other cost corrections.
  *
  * The footer indicator is scoped to the selected model and quotes the rate that
  * applies to it right now, in dollars per million tokens: with the default
- * schedule, `· $0.30/$1.20/M` at peak and `· ▼ off-peak $0.15/$0.60/M` off it.
- * The rate is the one pi recorded scaled by the schedule, so it always agrees
- * with the cost this extension writes. A session on a provider or model no
- * schedule covers never shows a rate, and switching models re-evaluates it.
+ * schedule, `· est. $0.30/$1.20/M` at peak and
+ * `· est. ▼ off-peak $0.15/$0.60/M` off it. This is a scheduled catalog estimate;
+ * request-specific corrections such as /fast can change the actual usage cost.
+ * Uncovered models show no rate; switching models re-evaluates it.
  *
  * The indicator is a snapshot of the current hour, and pi fires no event while a
  * session sits idle — so a timer armed at the next window boundary keeps it from
@@ -36,8 +35,8 @@
  *
  * - The rate is chosen from the request's START time, not its end. DeepSeek
  *   bills by when a request arrives, so a request spanning a window boundary
- *   would otherwise be billed on the wrong side of it. `message_start` gives
- *   the start; `message_end` gives the end.
+ *   would otherwise be billed on the wrong side of it. The provider's message
+ *   timestamp records invocation; completion wall-clock time is not used.
  * - A schedule declares the multiplier INSIDE its windows and `outside` for
  *   every other hour. Which side pi's recorded rate sits on is not assumed:
  *   encode it in the config, and only the difference is applied. Only DeepSeek
@@ -55,15 +54,16 @@
  * - Unknown or malformed configuration falls back to the defaults with a
  *   warning; no path throws from a message handler.
  *
- * Coverage limit: assistant messages carry the bulk of a session's spend.
- * Compaction and branch-summary usage and token usage reported by tools also
- * feed footer totals, but pi exposes no hook that can adjust them afterwards,
- * so those stay at list rates and the footer stays an estimate, not an invoice.
+ * All costs remain estimates, not invoices: server arrival, Chinese public
+ * holidays, and usage outside observed provider requests are not modeled.
  */
 
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { applyMultiplier, handledUsage, requestPricing } from "./request-pricing.ts";
+
+export { applyMultiplier } from "./request-pricing.ts";
 
 export const STATUS_KEY = "peak-hours";
 /**
@@ -415,29 +415,12 @@ export function statusIndicator(
 
 	switch (rateStateAt(now, schedule)) {
 		case "peak":
-			return `· ${STATUS_PEAK} ${rate}`;
+			return `· est. ${STATUS_PEAK} ${rate}`;
 		case "off-peak":
-			return `· ${STATUS_OFF_PEAK} ${rate}`;
+			return `· est. ${STATUS_OFF_PEAK} ${rate}`;
 		default:
-			return `· ${rate}`;
+			return `· est. ${rate}`;
 	}
-}
-
-export interface CostBreakdown extends RateCard {
-	total: number;
-}
-
-/** Scale every rate field and recompute `total` from them, as pi itself does. */
-export function applyMultiplier(cost: CostBreakdown, multiplier: number): CostBreakdown {
-	const scaled: CostBreakdown = {
-		input: cost.input * multiplier,
-		output: cost.output * multiplier,
-		cacheRead: cost.cacheRead * multiplier,
-		cacheWrite: cost.cacheWrite * multiplier,
-		total: 0,
-	};
-	scaled.total = scaled.input + scaled.output + scaled.cacheRead + scaled.cacheWrite;
-	return scaled;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -525,6 +508,15 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 	let active = parseActive(config.active);
 	const adjusted = adjustedMessages();
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	const pricing = requestPricing(pi, {
+		covers: (model) => scheduleFor(schedules, model.provider, model.id) !== undefined,
+		snapshot(model) {
+			// Refresh replaces schedules rather than mutating them. Capturing this
+			// resolved schedule and toggle freezes the decision for this request.
+			const schedule = active ? scheduleFor(schedules, model.provider, model.id) : undefined;
+			return (timestamp) => schedule ? multiplierAt(new Date(timestamp), schedule) : 1;
+		},
+	}, disarm);
 
 	function refresh(): void {
 		config = readConfig(configPath);
@@ -594,21 +586,28 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		const rateState = rateStateAt(now, schedule);
 		const state = rateState === "none" ? "no correction right now" : `${rateState} ×${multiplier} right now`;
 		const detail = rate ? `${state} (${rate})` : state;
-		ctx.ui.notify(`Peak hours: ${detail}. ${describeSchedule(schedule)}`, "info");
+		ctx.ui.notify(`Peak hours estimate: ${detail}. ${describeSchedule(schedule)}. Costs are not an invoice.`, "info");
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		refresh();
-		updateStatus(ctx);
+		await pricing.start(ctx);
+		if (pricing.isCurrent(ctx)) updateStatus(ctx);
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		await pricing.reconcile(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		disarm();
+		pricing.stop();
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 
 	pi.on("model_select", async (event, ctx) => {
-		updateStatus(ctx, event.model);
+		refresh();
+		await pricing.reconcile(ctx, event.model);
+		if (pricing.isCurrent(ctx)) updateStatus(ctx, event.model);
 	});
 
 	// The window boundary can pass between messages, and the footer quotes a price
@@ -622,6 +621,10 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		if (message.role !== "assistant") return;
 		if (adjusted.has(message)) return;
 		if (!message.usage?.cost) return;
+		if (handledUsage.has(message.usage)) {
+			updateStatus(ctx);
+			return;
+		}
 
 		// Pi providers stamp their output at invocation, before HTTP dispatch.
 		// This clock belongs to the foreground response even when the global
@@ -645,6 +648,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		}
 
 		adjusted.add(message);
+		handledUsage.add(message.usage);
 		updateStatus(ctx);
 		const replacement = {
 			...message,
@@ -657,6 +661,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 		// the guard for a retry that re-delivers it; registering the replacement
 		// covers a caller that replays the returned value instead.
 		adjusted.add(replacement);
+		handledUsage.add(replacement.usage);
 		return { message: replacement };
 	});
 
@@ -671,6 +676,8 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 			const arg = args.trim().toLowerCase();
 			if (!arg || arg === "status") {
 				refresh();
+				await pricing.reconcile(ctx);
+				if (!pricing.isCurrent(ctx)) return;
 				updateStatus(ctx);
 				notifyStatus(ctx);
 				return;
@@ -681,6 +688,8 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 			}
 			writeActive(configPath, arg === "on");
 			refresh();
+			await pricing.reconcile(ctx);
+			if (!pricing.isCurrent(ctx)) return;
 			updateStatus(ctx);
 			notifyStatus(ctx);
 		},

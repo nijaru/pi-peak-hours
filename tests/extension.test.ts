@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { cleanupSessionResources, type AssistantMessage } from "@earendil-works/pi-ai";
 import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
 import { OPENROUTER_MODELS } from "@earendil-works/pi-ai/providers/openrouter.models";
 import { XIAOMI_MODELS } from "@earendil-works/pi-ai/providers/xiaomi.models";
@@ -27,6 +27,7 @@ import peakHours, {
 	STATUS_OFF_PEAK,
 	STATUS_PEAK,
 } from "../extensions/index.ts";
+import { OBSERVE_USAGE, USAGE_OBSERVER_READY, type UsageRequest } from "../extensions/request-pricing.ts";
 
 test("describes a schedule with no windows as the outside rate all day", async () => {
 	const path = configPath();
@@ -35,6 +36,7 @@ test("describes a schedule with no windows as the outside rate all day", async (
 	}));
 	const h = harness(path);
 	h.select({ provider: "fixture", id: "fixture", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } });
+	await h.emit("session_start");
 	await h.command("status");
 	expect(h.notes.at(-1)).toContain("×0.5 always");
 	expect(h.notes.at(-1)).not.toContain("×1 always");
@@ -106,7 +108,7 @@ test("an explicit reseller schedule still corrects costs", async () => {
 	const message = assistantMessage({ provider: model.provider, model: model.id });
 	const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
 	expect(result?.message.usage.cost.total).toBeCloseTo(0.6, 12);
-	expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.12/$0.48${RATE_UNIT}`);
+	expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.12/$0.48${RATE_UNIT}`);
 });
 
 const RATES: RateCard = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
@@ -158,11 +160,24 @@ function assistantMessage(overrides: { provider?: string; model?: string; usage?
 	} as unknown as AssistantMessage;
 }
 
-function harness(path: string, options: { hasUI?: boolean } = {}) {
+function harness(path: string, options: { hasUI?: boolean; available?: ModelRate[]; discover?: () => Promise<ModelRate[]> } = {}) {
+	const listeners = new Map<string, Set<(value: unknown) => void>>();
+	const events = {
+		on(channel: string, handler: (value: unknown) => void) {
+			const handlers = listeners.get(channel) ?? new Set();
+			listeners.set(channel, handlers);
+			handlers.add(handler);
+			return () => { handlers.delete(handler); };
+		},
+		emit(channel: string, value: unknown) {
+			for (const handler of listeners.get(channel) ?? []) handler(value);
+		},
+	};
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 	const commands = new Map<string, CommandOptions>();
 	peakHours(
 		{
+			events,
 			on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => {
 				handlers.set(event, handler);
 			},
@@ -176,7 +191,10 @@ function harness(path: string, options: { hasUI?: boolean } = {}) {
 	const statuses: Array<string | undefined> = [];
 	const notes: string[] = [];
 	let model: ModelRate | undefined;
+	const sessionId = crypto.randomUUID();
 	const ctx = {
+		sessionManager: { getSessionId: () => sessionId },
+		modelRegistry: { getAvailable: async () => options.discover ? options.discover() : options.available ?? [] },
 		hasUI: options.hasUI ?? true,
 		ui: {
 			setStatus: (key: string, value?: string) => {
@@ -193,6 +211,8 @@ function harness(path: string, options: { hasUI?: boolean } = {}) {
 
 	cleanups.push(async () => handlers.get("session_shutdown")?.({}, ctx));
 	return {
+		context: ctx,
+		events,
 		select(next?: ModelRate) {
 			model = next;
 		},
@@ -281,7 +301,7 @@ describe("peak hours handlers", () => {
 			(result?.message.usage.cost.input ?? 0) + (result?.message.usage.cost.output ?? 0),
 			12,
 		);
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 
 		// The replacement keeps everything else about the message.
 		expect(result?.message.provider).toBe("deepseek");
@@ -379,7 +399,7 @@ describe("peak hours handlers", () => {
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message: assistantMessage() });
 
 		expect(result?.message.usage.cost.total).toBeCloseTo(0.375, 12);
-		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
 	});
 
 	test("clears the status when no model is selected or the session ends", async () => {
@@ -392,7 +412,7 @@ describe("peak hours handlers", () => {
 
 		h.select(DEEPSEEK);
 		await h.emit("model_select", { model: DEEPSEEK });
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 
 		await h.emit("session_shutdown");
 		expect(h.status()).toBeUndefined();
@@ -411,9 +431,9 @@ describe("peak hours handlers", () => {
 
 		h.select(DEEPSEEK);
 		await h.emit("model_select", { model: DEEPSEEK });
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		await h.emit("turn_start", { turnIndex: 3 });
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 	});
 	test("toggles from the command and persists the choice", async () => {
 		const path = configPath();
@@ -430,7 +450,7 @@ describe("peak hours handlers", () => {
 
 		await h.command("on");
 		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(true);
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		expect(h.notes.at(-1)).toContain("peak ×2 right now");
 
 		await h.command("nonsense");
@@ -450,7 +470,7 @@ describe("peak hours handlers", () => {
 		const message = assistantMessage();
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
 		expect(result?.message.usage.cost.total).toBeCloseTo(0.375, 12);
-		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
 		await h.command("off");
 		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(false);
 		expect(h.status()).toBeUndefined();
@@ -474,9 +494,176 @@ describe("peak hours handlers", () => {
 		h.select(DEEPSEEK);
 		await h.emit("session_start");
 
-		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message: assistantMessage() });
 		expect(result?.message.usage.cost.total).toBeCloseTo(1.5, 12);
+	});
+});
+
+// The companion is a boundary here, not a second provider implementation. It
+// accepts leases and exposes the exact dispatch/terminal callbacks in the wire contract.
+function companion(h: ReturnType<typeof harness>, accept = (_request: UsageRequest) => true) {
+	const requests: UsageRequest[] = [];
+	const leases: Array<{ request: UsageRequest; installed: boolean; removed: boolean }> = [];
+	h.events.on(OBSERVE_USAGE, (value) => {
+		const request = value as UsageRequest;
+		requests.push(request);
+		request.handled = true;
+		if (!accept(request)) { request.respond(undefined); return; }
+		const state = { request, installed: true, removed: false };
+		leases.push(state);
+		request.respond({
+			provider: request.model.provider,
+			isInstalled: () => state.installed && !state.removed,
+			remove: () => { state.removed = true; },
+		});
+	});
+	return { requests, leases };
+}
+
+describe("request-wide pricing client", () => {
+	// Existing foreground tests cannot expose a dispatch-time decision being
+	// overwritten by config refresh, or the fallback scaling stream usage twice.
+	test.each([
+		{ name: "scaled", active: true, started: "01:30", factor: 2 },
+		{ name: "1x", active: true, started: "00:59", factor: 1 },
+		{ name: "inactive", active: false, started: "01:30", factor: 1 },
+	])("freezes $name decisions at dispatch and never reapplies fallback", async ({ active, started, factor }) => {
+		const path = configPath();
+		write(path, { active, windows: [["01:00", "02:00"]], multiplier: 2, outside: 1 });
+		const h = harness(path);
+		h.select(DEEPSEEK_MODELS["deepseek-flash"]);
+		const server = companion(h);
+		await h.emit("session_start");
+		setSystemTime(new Date("2026-09-15T05:00:00Z"));
+		const dispatch = server.leases[0]!.request.priceFor({ provider: "deepseek", id: "deepseek-flash" });
+		setSystemTime(new Date(`2026-09-15T${started}:00Z`));
+		const message = assistantMessage({ usage: {
+			cacheRead: 11, cacheWrite: 7, totalTokens: 2_000_018,
+			// Existing request-specific correction, such as /fast, must survive.
+			cost: { input: 0.45, output: 1.8, cacheRead: 0.03, cacheWrite: 0.12, total: 2.4 },
+		} });
+		const tokens = { ...message.usage };
+		write(path, { ...SURCHARGE, multiplier: 3 });
+		await h.command("on");
+		setSystemTime(new Date("2026-09-15T05:00:00Z"));
+		dispatch(message.timestamp, message.usage);
+		expect(message.usage.cost).toEqual({ input: 0.45 * factor, output: 1.8 * factor, cacheRead: 0.03 * factor, cacheWrite: 0.12 * factor, total: 2.4 * factor });
+		expect({ ...message.usage, cost: tokens.cost }).toEqual(tokens);
+		// Replayed terminal usage and a different message sharing that usage are
+		// protected globally, not merely by the old message-object guard.
+		dispatch(message.timestamp, message.usage);
+		expect(await h.emit("message_end", { message })).toBeUndefined();
+		expect(await h.emit("message_end", { message: { ...message } })).toBeUndefined();
+		expect(message.usage.cost.total).toBeCloseTo(2.4 * factor, 12);
+	});
+
+	test.each(["before", "after"])("acquires when companion starts %s the client and reacquires retired leases", async (order) => {
+		const path = configPath();
+		write(path, SURCHARGE);
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		if (order === "after") await h.emit("session_start");
+		const server = companion(h);
+		if (order === "before") await h.emit("session_start");
+		else h.events.emit(USAGE_OBSERVER_READY, { context: h.context });
+		expect(server.leases).toHaveLength(1);
+		const first = server.leases[0]!;
+		first.installed = false;
+		await h.emit("before_agent_start");
+		expect(first.removed).toBe(true);
+		expect(server.leases).toHaveLength(2);
+		await h.emit("model_select", { model: DEEPSEEK });
+		expect(server.leases).toHaveLength(2);
+	});
+
+	test("covers available custom schedules plus current, tries candidate APIs, and prices the actual target", async () => {
+		const path = configPath();
+		write(path, { schedules: [
+			{ providers: ["fixture"], models: ["cheap"], outside: 0.5 },
+			{ providers: ["fixture"], models: ["*"], outside: 2 },
+			{ providers: ["deepseek"], outside: 0.5 },
+		] });
+		const model = (id: string, api: string) => ({ ...DEEPSEEK_MODELS["deepseek-flash"], provider: "fixture", id, api });
+		const rejected = model("cheap", "unsupported");
+		const accepted = model("expensive", "openai-completions");
+		const h = harness(path, { available: [rejected, accepted, model("third", "openai-completions"), ASTRA] });
+		h.select(DEEPSEEK); // included even if not in getAvailable()
+		const server = companion(h, (request) => request.model.api !== "unsupported");
+		await h.emit("session_start");
+		expect(server.requests.map((request) => request.model.id)).toEqual([DEEPSEEK.id, "cheap", "expensive"]);
+		expect(server.requests.at(-1)?.model).toBe(accepted); // full model, not a reconstructed key
+		const fixture = server.leases.find((lease) => lease.request.model.provider === "fixture")!;
+		for (const [id, factor] of [["cheap", 0.5], ["expensive", 2]] as const) {
+			const message = assistantMessage({ provider: "fixture", model: id });
+			fixture.request.priceFor({ provider: "fixture", id })(message.timestamp, message.usage);
+			expect(message.usage.cost.total).toBeCloseTo(0.75 * factor, 12);
+			expect(await h.emit("message_end", { message })).toBeUndefined();
+		}
+	});
+
+	test("keeps in-flight snapshots after schedule removal and releases only owned leases on SDK disposal", async () => {
+		const path = configPath();
+		write(path, SURCHARGE);
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		const server = companion(h);
+		await h.emit("session_start");
+		const lease = server.leases[0]!;
+		const finish = lease.request.priceFor(DEEPSEEK);
+		write(path, { providers: ["other"], outside: 0.5 });
+		await h.command("status");
+		expect(lease.removed).toBe(false);
+		const message = assistantMessage();
+		finish(message.timestamp, message.usage);
+		expect(message.usage.cost.total).toBeCloseTo(1.5, 12);
+		const other = harness(path);
+		other.select({ ...DEEPSEEK, provider: "other" });
+		const otherServer = companion(other);
+		await other.emit("session_start");
+		cleanupSessionResources(h.context.sessionManager.getSessionId());
+		expect(lease.removed).toBe(true);
+		expect(otherServer.leases[0]!.removed).toBe(false);
+		h.events.emit(USAGE_OBSERVER_READY, { context: h.context });
+		expect(server.leases).toHaveLength(1);
+	});
+
+	test("client-first readiness covers already discovered auxiliary providers synchronously", async () => {
+		const path = configPath();
+		write(path, { schedules: [{ providers: ["deepseek", "fixture"], outside: 0.5 }] });
+		const auxiliary = { ...DEEPSEEK_MODELS["deepseek-flash"], provider: "fixture" };
+		const h = harness(path, { available: [auxiliary] });
+		h.select(DEEPSEEK);
+		await h.emit("session_start");
+		const server = companion(h);
+		h.events.emit(USAGE_OBSERVER_READY, { context: h.context });
+		expect(server.leases.map((lease) => lease.request.model.provider)).toEqual(["deepseek", "fixture"]);
+	});
+
+	test("disposal during available-model discovery cannot acquire leases or render stale context", async () => {
+		const path = configPath();
+		write(path, SURCHARGE);
+		let complete!: (models: ModelRate[]) => void;
+		const h = harness(path, { discover: () => new Promise((resolve) => { complete = resolve; }) });
+		const server = companion(h);
+		const starting = h.emit("session_start");
+		cleanupSessionResources(h.context.sessionManager.getSessionId());
+		complete([DEEPSEEK]);
+		await starting;
+		expect(server.requests).toHaveLength(0);
+		expect(h.statuses).toHaveLength(0);
+	});
+
+	test("ignores readiness from another session or registry", async () => {
+		const h = harness(configPath());
+		h.select(DEEPSEEK);
+		await h.emit("session_start");
+		const server = companion(h);
+		const other = harness(configPath());
+		h.events.emit(USAGE_OBSERVER_READY, { context: other.context });
+		h.events.emit(USAGE_OBSERVER_READY, { context: { ...h.context, sessionManager: other.context.sessionManager } });
+		h.events.emit(USAGE_OBSERVER_READY, { context: { ...h.context, modelRegistry: other.context.modelRegistry } });
+		expect(server.requests).toHaveLength(0);
 	});
 });
 
@@ -503,7 +690,7 @@ describe("window boundary timer", () => {
 
 		try {
 			await h.emit("session_start");
-			expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+			expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 			// Armed for the boundary itself, not for a poll interval.
 			expect(timers.armed()).toHaveLength(1);
 			expect(timers.armed()[0]?.delay).toBe(30_000);
@@ -512,7 +699,7 @@ describe("window boundary timer", () => {
 			setSystemTime(new Date("2026-09-15T04:00:01Z"));
 			timers.armed()[0]?.run();
 
-			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
+			expect(h.status()).toBe(`· est. $0.15/$0.6${RATE_UNIT}`);
 			// The expired timer is gone, and the next boundary is 01:00 the next day.
 			expect(timers.armed()).toHaveLength(1);
 			expect(timers.armed()[0]?.delay).toBe(new Date("2026-09-16T01:00:00Z").getTime() - Date.now());
@@ -591,7 +778,7 @@ describe("window boundary timer", () => {
 
 		try {
 			await h.emit("session_start");
-			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
+			expect(h.status()).toBe(`· est. $0.15/$0.6${RATE_UNIT}`);
 			expect(timers.armed()).toHaveLength(0);
 		} finally {
 			timers.restore();
