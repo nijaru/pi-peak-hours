@@ -52,8 +52,8 @@
  *   modified, so any rate derived from cost/tokens stays self-consistent
  *   (cache-miss accounting derives paid and read rates from the same message
  *   and scales with it).
- * - Unknown or malformed configuration leaves the extension inert after a
- *   single warning; it never throws inside a message handler.
+ * - Unknown or malformed configuration falls back to the defaults with a
+ *   warning; no path throws from a message handler.
  *
  * Coverage limit: assistant messages carry the bulk of a session's spend.
  * Compaction and branch-summary usage and token usage reported by tools also
@@ -271,11 +271,6 @@ export function multiplierAt(startedAt: Date, schedule: Schedule): number {
 	return schedule.outside;
 }
 
-/** Whether the rate in force costs more than the one pi recorded. */
-export function isPeakAt(startedAt: Date, schedule: Schedule): boolean {
-	return multiplierAt(startedAt, schedule) > 1;
-}
-
 const MS_PER_MINUTE = 60_000;
 
 /**
@@ -450,7 +445,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Missing or malformed config uses defaults; parsing failures are reported. */
-export function readConfig(path: string): ConfigFile | undefined {
+export function readConfig(path: string): ConfigFile {
 	if (!existsSync(path)) return {};
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -469,10 +464,8 @@ export function readConfig(path: string): ConfigFile | undefined {
 /** Persist `active` while preserving keys this version does not model. */
 export function writeActive(path: string, active: boolean): void {
 	try {
-		const existing = readConfig(path) ?? {};
-		const merged = isRecord(existing) ? { ...existing, active } : { active };
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+		writeFileSync(path, `${JSON.stringify({ ...readConfig(path), active }, null, 2)}\n`, "utf8");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.warn(`[${STATUS_KEY}] Failed to write ${path}: ${message}`);
@@ -527,14 +520,14 @@ function adjustedMessages(): WeakSet<object> {
 
 export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = {}): void {
 	const configPath = options.configPath ?? CONFIG_PATH;
-	let config = readConfig(configPath) ?? {};
+	let config = readConfig(configPath);
 	let schedules = resolveSchedules(config);
 	let active = parseActive(config.active);
 	const adjusted = adjustedMessages();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	function refresh(): void {
-		config = readConfig(configPath) ?? {};
+		config = readConfig(configPath);
 		schedules = resolveSchedules(config);
 		active = parseActive(config.active);
 	}
@@ -562,7 +555,7 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 
 		const next = nextTransitionAt(now, schedule);
 		if (!next) return;
-		// Floored, so a boundary crossed between reading the clock and arming the
+		// Clamped, so a boundary crossed between reading the clock and arming the
 		// timer cannot spin it; unreferenced, so a pending window never keeps pi
 		// alive after its work is done.
 		timer = setTimeout(() => {
@@ -595,14 +588,11 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 			ctx.ui.notify(`Peak hours: not applied to ${model.provider}/${model.id}. ${describeAll(schedules)}`, "info");
 			return;
 		}
-		const multiplier = multiplierAt(new Date(), schedule);
+		const now = new Date();
+		const multiplier = multiplierAt(now, schedule);
 		const rate = describeRate(model.cost, multiplier);
-		const state =
-			multiplier > 1
-				? `peak ×${multiplier} right now`
-				: multiplier < 1
-					? `off-peak ×${multiplier} right now`
-					: "no correction right now";
+		const rateState = rateStateAt(now, schedule);
+		const state = rateState === "none" ? "no correction right now" : `${rateState} ×${multiplier} right now`;
 		const detail = rate ? `${state} (${rate})` : state;
 		ctx.ui.notify(`Peak hours: ${detail}. ${describeSchedule(schedule)}`, "info");
 	}
@@ -663,9 +653,9 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 				cost: applyMultiplier(message.usage.cost, multiplier),
 			},
 		};
-		// pi copies this onto the original, so the original's identity already
-		// carries the guard; registering the replacement covers a caller that
-		// replays the returned value instead.
+		// pi consumes the returned replacement, so the original identity carries
+		// the guard for a retry that re-delivers it; registering the replacement
+		// covers a caller that replays the returned value instead.
 		adjusted.add(replacement);
 		return { message: replacement };
 	});

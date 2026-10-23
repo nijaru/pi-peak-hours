@@ -8,7 +8,6 @@ import {
 	DEFAULT_ACTIVE,
 	DEFAULT_SCHEDULE,
 	describeRate,
-	isPeakAt,
 	matchesPattern,
 	matchesSchedule,
 	multiplierAt,
@@ -166,30 +165,20 @@ describe("resolveSchedules", () => {
 	});
 });
 
-describe("isPeakAt", () => {
+describe("multiplierAt", () => {
 	test.each([[weekday(1), 2], [weekday(3, 59), 2], [weekday(4), 1], [weekday(5, 59), 1], [weekday(6), 2], [weekday(9, 59), 2], [weekday(10), 1], [saturday(2), 1], [saturday(9), 1]] as const)("honors weekday windows and inclusive/exclusive edges at %s", (date, multiplier) => {
 		const schedule = resolveSchedule({ multiplier: 2, outside: 1 });
 		expect(multiplierAt(date, schedule)).toBe(multiplier);
-		expect(isPeakAt(date, schedule)).toBe(multiplier > 1);
 	});
 
 	test("supports windows that cross midnight", () => {
 		const schedule = resolveSchedule({ windows: [["23:00", "02:00"]], days: ["fri"], multiplier: 2, outside: 1 });
-		expect(isPeakAt(new Date(Date.UTC(2026, 8, 11, 23, 30)), schedule)).toBe(true);
+		expect(multiplierAt(new Date(Date.UTC(2026, 8, 11, 23, 30)), schedule)).toBe(2);
 		// The tail belongs to Friday's window, even though it lands on Saturday.
-		expect(isPeakAt(new Date(Date.UTC(2026, 8, 12, 1, 0)), schedule)).toBe(true);
-		expect(isPeakAt(new Date(Date.UTC(2026, 8, 12, 3, 0)), schedule)).toBe(false);
+		expect(multiplierAt(new Date(Date.UTC(2026, 8, 12, 1, 0)), schedule)).toBe(2);
+		expect(multiplierAt(new Date(Date.UTC(2026, 8, 12, 3, 0)), schedule)).toBe(1);
 		// Monday 23:30 is not Friday, so it never opens a window.
-		expect(isPeakAt(new Date(Date.UTC(2026, 8, 14, 23, 30)), schedule)).toBe(false);
-	});
-});
-
-describe("multiplierAt", () => {
-	test("applies `outside` everywhere the windows do not reach", () => {
-		const schedule = resolveSchedule({ multiplier: 2, outside: 1.5 });
-		expect(multiplierAt(weekday(2), schedule)).toBe(2);
-		expect(multiplierAt(weekday(5), schedule)).toBe(1.5);
-		expect(multiplierAt(saturday(2), schedule)).toBe(1.5);
+		expect(multiplierAt(new Date(Date.UTC(2026, 8, 14, 23, 30)), schedule)).toBe(1);
 	});
 
 	test("models a discount as a rate below 1", () => {
@@ -198,9 +187,7 @@ describe("multiplierAt", () => {
 		const schedule = resolveSchedule({ windows: [["06:00", "10:00"]], multiplier: 1, outside: 0.5 });
 
 		expect(multiplierAt(weekday(7), schedule)).toBe(1);
-		expect(isPeakAt(weekday(7), schedule)).toBe(false);
 		expect(multiplierAt(weekday(2), schedule)).toBe(0.5);
-		expect(isPeakAt(weekday(2), schedule)).toBe(false);
 	});
 
 	test("prefers a window's own multiplier", () => {
@@ -286,22 +273,14 @@ describe("nextTransitionAt", () => {
 });
 
 describe("applyMultiplier", () => {
-	test("scales every rate field and recomputes total from them", () => {
-		const scaled = applyMultiplier({ input: 0.01, output: 0.02, cacheRead: 0.001, cacheWrite: 0.004, total: 0.035 }, 2);
+	test.each([
+		[2, { input: 0.01, output: 0.02, cacheRead: 0.001, cacheWrite: 0.004 }, { input: 0.02, output: 0.04, cacheRead: 0.002, cacheWrite: 0.008 }],
+		[0.5, { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }, { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 }],
+	] as const)("scales every rate field by %s and recomputes total", (multiplier, cost, expected) => {
+		const scaled = applyMultiplier({ ...cost, total: 0 }, multiplier);
 
-		expect(scaled).toEqual({ input: 0.02, output: 0.04, cacheRead: 0.002, cacheWrite: 0.008, total: 0.07 });
-		expect(scaled.total).toBeCloseTo(scaled.input + scaled.output + scaled.cacheRead + scaled.cacheWrite, 12);
+		expect(scaled).toEqual({ ...expected, total: expected.input + expected.output + expected.cacheRead + expected.cacheWrite });
 	});
-
-	test("scales down for a discount and still recomputes total", () => {
-		const scaled = applyMultiplier({ input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0, total: 1.506 }, 0.5);
-
-		expect(scaled.input).toBeCloseTo(0.15, 12);
-		expect(scaled.output).toBeCloseTo(0.6, 12);
-		expect(scaled.cacheRead).toBeCloseTo(0.003, 12);
-		expect(scaled.total).toBeCloseTo(0.753, 12);
-	});
-
 });
 
 describe("parseActive", () => {
@@ -431,7 +410,7 @@ describe("config files", () => {
 		const path = join(dir, "broken.json");
 		writeFileSync(path, "{not json", "utf8");
 		expect(readConfig(path)).toEqual({});
-		expect(resolveSchedule(readConfig(path) ?? {})).toEqual(DEFAULT_SCHEDULE);
+		expect(resolveSchedule(readConfig(path))).toEqual(DEFAULT_SCHEDULE);
 	});
 
 	test("writing the toggle preserves keys this version does not model", () => {

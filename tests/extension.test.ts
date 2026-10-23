@@ -431,6 +431,7 @@ describe("peak hours handlers", () => {
 		await h.command("on");
 		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(true);
 		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.notes.at(-1)).toContain("peak ×2 right now");
 
 		await h.command("nonsense");
 		expect(h.notes.at(-1)).toBe("Usage: /peak-hours [on|off|status]");
@@ -441,13 +442,15 @@ describe("peak hours handlers", () => {
 		writeFileSync(path, "{not json", "utf8");
 		const h = harness(path);
 		h.select(DEEPSEEK);
+		// Wednesday 05:00 UTC is outside the stock DeepSeek windows, so the
+		// fallback schedule's ×0.5 is deterministic.
+		setSystemTime(new Date("2026-09-16T05:00:00Z"));
 		await h.emit("session_start");
 
 		const message = assistantMessage();
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
-		// Malformed config uses stock-catalog defaults (1x peak, 0.5x off-peak).
-		const total = result?.message.usage.cost.total ?? message.usage.cost.total;
-		expect([0.375, 0.75]).toContain(Number(total.toFixed(6)));
+		expect(result?.message.usage.cost.total).toBeCloseTo(0.375, 12);
+		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
 		await h.command("off");
 		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(false);
 		expect(h.status()).toBeUndefined();
