@@ -8,6 +8,7 @@
  */
 
 import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,7 +109,7 @@ test("an explicit reseller schedule still corrects costs", async () => {
 	const message = assistantMessage({ provider: model.provider, model: model.id });
 	const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
 	expect(result?.message.usage.cost.total).toBeCloseTo(0.6, 12);
-	expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.12/$0.48${RATE_UNIT}`);
+	expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.12/$0.48${RATE_UNIT}`);
 });
 
 const RATES: RateCard = { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 };
@@ -190,6 +191,7 @@ function harness(path: string, options: { hasUI?: boolean; available?: ModelRate
 
 	const statuses: Array<string | undefined> = [];
 	const notes: string[] = [];
+	const noteTypes: Array<"info" | "warning" | "error" | undefined> = [];
 	let model: ModelRate | undefined;
 	const sessionId = crypto.randomUUID();
 	const ctx = {
@@ -200,8 +202,9 @@ function harness(path: string, options: { hasUI?: boolean; available?: ModelRate
 			setStatus: (key: string, value?: string) => {
 				if (key === STATUS_KEY) statuses.push(value);
 			},
-			notify: (message: string) => {
+			notify: (message: string, type?: "info" | "warning" | "error") => {
 				notes.push(message);
+				noteTypes.push(type);
 			},
 		},
 		get model() {
@@ -218,6 +221,7 @@ function harness(path: string, options: { hasUI?: boolean; available?: ModelRate
 		},
 		statuses,
 		notes,
+		noteTypes,
 		status: () => statuses.at(-1),
 		async emit<T = unknown>(event: string, payload: Record<string, unknown> = {}): Promise<T | undefined> {
 			const handler = handlers.get(event);
@@ -301,7 +305,7 @@ describe("peak hours handlers", () => {
 			(result?.message.usage.cost.input ?? 0) + (result?.message.usage.cost.output ?? 0),
 			12,
 		);
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 
 		// The replacement keeps everything else about the message.
 		expect(result?.message.provider).toBe("deepseek");
@@ -399,7 +403,7 @@ describe("peak hours handlers", () => {
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message: assistantMessage() });
 
 		expect(result?.message.usage.cost.total).toBeCloseTo(0.375, 12);
-		expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
 	});
 
 	test("clears the status when no model is selected or the session ends", async () => {
@@ -412,7 +416,7 @@ describe("peak hours handlers", () => {
 
 		h.select(DEEPSEEK);
 		await h.emit("model_select", { model: DEEPSEEK });
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 
 		await h.emit("session_shutdown");
 		expect(h.status()).toBeUndefined();
@@ -431,9 +435,9 @@ describe("peak hours handlers", () => {
 
 		h.select(DEEPSEEK);
 		await h.emit("model_select", { model: DEEPSEEK });
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		await h.emit("turn_start", { turnIndex: 3 });
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 	});
 	test("toggles from the command and persists the choice", async () => {
 		const path = configPath();
@@ -450,16 +454,17 @@ describe("peak hours handlers", () => {
 
 		await h.command("on");
 		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(true);
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		expect(h.notes.at(-1)).toContain("peak ×2 right now");
 
 		await h.command("nonsense");
 		expect(h.notes.at(-1)).toBe("Usage: /peak-hours [on|off|status]");
 	});
 
-	test("survives a malformed config and still reports a rate", async () => {
+	test("survives a malformed config, refuses to overwrite it, and still reports a rate", async () => {
 		const path = configPath();
-		writeFileSync(path, "{not json", "utf8");
+		const original = "{not json";
+		writeFileSync(path, original, "utf8");
 		const h = harness(path);
 		h.select(DEEPSEEK);
 		// Wednesday 05:00 UTC is outside the stock DeepSeek windows, so the
@@ -470,10 +475,34 @@ describe("peak hours handlers", () => {
 		const message = assistantMessage();
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message });
 		expect(result?.message.usage.cost.total).toBeCloseTo(0.375, 12);
-		expect(h.status()).toBe(`· est. ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
 		await h.command("off");
-		expect(JSON.parse(readFileSync(path, "utf8")).active).toBe(false);
-		expect(h.status()).toBeUndefined();
+		expect(readFileSync(path, "utf8")).toBe(original);
+		expect(h.notes.at(-1)).toMatch(/failed to save configuration/);
+		expect(h.noteTypes.at(-1)).toBe("error");
+		expect(h.status()).toBe(`· ${STATUS_OFF_PEAK} $0.075/$0.3${RATE_UNIT}`);
+	});
+
+	test("a failed toggle save reports failure and keeps the previous setting", async () => {
+		const path = configPath();
+		write(path, { ...SURCHARGE, active: true });
+		const h = harness(path);
+		h.select(DEEPSEEK);
+		await h.emit("session_start");
+		const original = readFileSync(path, "utf8");
+		const writeSpy = spyOn(fs, "writeFileSync").mockImplementation(() => {
+			throw new Error("SECRET-BACKEND-BODY");
+		});
+		try {
+			await h.command("off");
+		} finally {
+			writeSpy.mockRestore();
+		}
+		expect(readFileSync(path, "utf8")).toBe(original);
+		expect(h.notes.at(-1)).toMatch(/failed to save configuration/);
+		expect(h.notes.at(-1)).not.toContain("SECRET-BACKEND-BODY");
+		expect(h.noteTypes.at(-1)).toBe("error");
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 	});
 
 	test("does nothing when the config turns correction off", async () => {
@@ -494,7 +523,7 @@ describe("peak hours handlers", () => {
 		h.select(DEEPSEEK);
 		await h.emit("session_start");
 
-		expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+		expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 		const result = await h.emit<{ message: AssistantMessage }>("message_end", { message: assistantMessage() });
 		expect(result?.message.usage.cost.total).toBeCloseTo(1.5, 12);
 	});
@@ -716,7 +745,7 @@ describe("window boundary timer", () => {
 
 		try {
 			await h.emit("session_start");
-			expect(h.status()).toBe(`· est. ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
+			expect(h.status()).toBe(`· ${STATUS_PEAK} $0.3/$1.2${RATE_UNIT}`);
 			// Armed for the boundary itself, not for a poll interval.
 			expect(timers.armed()).toHaveLength(1);
 			expect(timers.armed()[0]?.delay).toBe(30_000);
@@ -725,7 +754,7 @@ describe("window boundary timer", () => {
 			setSystemTime(new Date("2026-09-15T04:00:01Z"));
 			timers.armed()[0]?.run();
 
-			expect(h.status()).toBe(`· est. $0.15/$0.6${RATE_UNIT}`);
+			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
 			// The expired timer is gone, and the next boundary is 01:00 the next day.
 			expect(timers.armed()).toHaveLength(1);
 			expect(timers.armed()[0]?.delay).toBe(new Date("2026-09-16T01:00:00Z").getTime() - Date.now());
@@ -804,7 +833,7 @@ describe("window boundary timer", () => {
 
 		try {
 			await h.emit("session_start");
-			expect(h.status()).toBe(`· est. $0.15/$0.6${RATE_UNIT}`);
+			expect(h.status()).toBe(`· $0.15/$0.6${RATE_UNIT}`);
 			expect(timers.armed()).toHaveLength(0);
 		} finally {
 			timers.restore();

@@ -15,8 +15,8 @@
  *
  * The footer indicator is scoped to the selected model and quotes the rate that
  * applies to it right now, in dollars per million tokens: with the default
- * schedule, `· est. $0.30/$1.20/M` at peak and
- * `· est. ▼ off-peak $0.15/$0.60/M` off it. This is a scheduled catalog estimate;
+ * schedule, `· $0.30/$1.20/M` at peak and
+ * `· ▼ off-peak $0.15/$0.60/M` off it. This is a scheduled catalog estimate;
  * request-specific corrections such as /fast can change the actual usage cost.
  * Uncovered models show no rate; switching models re-evaluates it.
  *
@@ -415,11 +415,11 @@ export function statusIndicator(
 
 	switch (rateStateAt(now, schedule)) {
 		case "peak":
-			return `· est. ${STATUS_PEAK} ${rate}`;
+			return `· ${STATUS_PEAK} ${rate}`;
 		case "off-peak":
-			return `· est. ${STATUS_OFF_PEAK} ${rate}`;
+			return `· ${STATUS_OFF_PEAK} ${rate}`;
 		default:
-			return `· est. ${rate}`;
+			return `· ${rate}`;
 	}
 }
 
@@ -444,14 +444,16 @@ export function readConfig(path: string): ConfigFile {
 	}
 }
 
-/** Persist `active` while preserving keys this version does not model. */
-export function writeActive(path: string, active: boolean): void {
+/** Refuse to replace unreadable/malformed config; preserve unknown valid keys. */
+export function writeActive(path: string, active: boolean): boolean {
 	try {
+		const config: unknown = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+		if (!isRecord(config)) return false;
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify({ ...readConfig(path), active }, null, 2)}\n`, "utf8");
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.warn(`[${STATUS_KEY}] Failed to write ${path}: ${message}`);
+		writeFileSync(path, `${JSON.stringify({ ...config, active }, null, 2)}\n`, "utf8");
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -686,7 +688,10 @@ export default function peakHours(pi: ExtensionAPI, options: PeakHoursOptions = 
 				ctx.ui.notify("Usage: /peak-hours [on|off|status]", "error");
 				return;
 			}
-			writeActive(configPath, arg === "on");
+			if (!writeActive(configPath, arg === "on")) {
+				ctx.ui.notify(`Peak hours: failed to save configuration at ${configPath}; keeping the previous setting.`, "error");
+				return;
+			}
 			refresh();
 			await pricing.reconcile(ctx);
 			if (!pricing.isCurrent(ctx)) return;

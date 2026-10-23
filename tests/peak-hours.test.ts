@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -331,9 +332,9 @@ describe("statusIndicator", () => {
 	const other = { provider: "openai-codex", id: "gpt-6-astra", cost };
 
 	test("quotes the rate in force, prefixed when it differs from the recorded one", () => {
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe("· est. $0.3/$1.2/M");
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe(`· est. ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
-		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(2))).toBe("· $0.3/$1.2/M");
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, weekday(5))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
+		expect(statusIndicator([DEFAULT_SCHEDULE], true, deepseek, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.15/$0.6/M`);
 	});
 
 	test("stays hidden for models no schedule covers", () => {
@@ -351,7 +352,7 @@ describe("statusIndicator", () => {
 		const schedules = [resolveSchedule({ providers: ["openrouter"], models: ["deepseek/*"] })];
 		const routed = { provider: "openrouter", id: "deepseek/v4", cost };
 
-		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe("· est. $0.3/$1.2/M");
+		expect(statusIndicator(schedules, true, routed, weekday(2))).toBe("· $0.3/$1.2/M");
 		expect(statusIndicator(schedules, true, deepseek, weekday(2))).toBeUndefined();
 	});
 
@@ -363,9 +364,9 @@ describe("statusIndicator", () => {
 
 		// 07:00 UTC is the window where the standard rate applies, so the rate is the
 		// recorded one and only the price is shown.
-		expect(statusIndicator(schedules, true, zai, weekday(7))).toBe("· est. $1.4/$4.4/M");
-		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
-		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· est. ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+		expect(statusIndicator(schedules, true, zai, weekday(7))).toBe("· $1.4/$4.4/M");
+		expect(statusIndicator(schedules, true, zai, weekday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
+		expect(statusIndicator(schedules, true, zai, saturday(2))).toBe(`· ${STATUS_OFF_PEAK} $0.7/$2.2/M`);
 	});
 });
 
@@ -418,9 +419,61 @@ describe("config files", () => {
 		const path = join(dir, "pi-peak-hours.json");
 		writeFileSync(path, `${JSON.stringify({ active: true, multiplier: 3, future: { keep: true } })}\n`, "utf8");
 
-		writeActive(path, false);
+		expect(writeActive(path, false)).toBe(true);
 
 		const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 		expect(written).toEqual({ active: false, multiplier: 3, future: { keep: true } });
+	});
+
+	test("creates a missing config when the toggle has somewhere safe to write", () => {
+		const dir = temporaryDirectory();
+		const path = join(dir, "pi-peak-hours.json");
+
+		expect(writeActive(path, false)).toBe(true);
+		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ active: false });
+	});
+
+	test("refuses to overwrite malformed config and preserves its bytes", () => {
+		const dir = temporaryDirectory();
+		const path = join(dir, "pi-peak-hours.json");
+		const original = "{not json\n";
+		writeFileSync(path, original, "utf8");
+
+		expect(writeActive(path, false)).toBe(false);
+		expect(readFileSync(path, "utf8")).toBe(original);
+	});
+
+	test("refuses to overwrite non-object JSON and preserves its bytes", () => {
+		const dir = temporaryDirectory();
+		for (const [name, original] of [["array.json", "[]\n"], ["null.json", "null\n"], ["string.json", "\"text\"\n"]] as const) {
+			const path = join(dir, name);
+			writeFileSync(path, original, "utf8");
+			expect(writeActive(path, false)).toBe(false);
+			expect(readFileSync(path, "utf8")).toBe(original);
+		}
+	});
+
+	test("refuses to overwrite an unreadable existing path", () => {
+		const dir = temporaryDirectory();
+		const path = join(dir, "pi-peak-hours.json");
+		mkdirSync(path);
+		expect(writeActive(path, false)).toBe(false);
+		expect(fs.statSync(path).isDirectory()).toBe(true);
+	});
+
+	test("a failed write leaves the existing config intact and reports failure", () => {
+		const dir = temporaryDirectory();
+		const path = join(dir, "pi-peak-hours.json");
+		const original = `${JSON.stringify({ active: true, future: { keep: true } })}\n`;
+		writeFileSync(path, original, "utf8");
+		const write = spyOn(fs, "writeFileSync").mockImplementation(() => {
+			throw new Error("simulated write failure");
+		});
+		try {
+			expect(writeActive(path, false)).toBe(false);
+		} finally {
+			write.mockRestore();
+		}
+		expect(readFileSync(path, "utf8")).toBe(original);
 	});
 });

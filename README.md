@@ -8,7 +8,7 @@ The default covers DeepSeek direct only: pi records it at the published **peak**
 
 With a compatible [pi-provider-compaction](https://github.com/nijaru/pi-provider-compaction) companion loaded, this extension scales existing `usage.cost` before request completion reaches stream consumers or cache observers. It covers observed foreground requests, compaction, branch summaries, and cache warming for scheduled providers. Without the companion, it still corrects finalized foreground assistant messages through `message_end`; auxiliary usage stays unchanged. Both paths preserve token counts and existing cost corrections such as `/fast`.
 
-The status line quotes the selected model's scheduled catalog estimate — `· est. $0.30/$1.20/M` during a peak window, `· est. ▼ off-peak $0.15/$0.60/M` off it. `▲ peak` or `▼ off-peak` marks a rate above or below pi's recorded rate. With stock peak-base prices, peak has no indicator and off-peak is marked as a discount. `/peak-hours status` names the schedule.
+The status line quotes the selected model's scheduled catalog estimate — `· $0.30/$1.20/M` during a peak window, `· ▼ off-peak $0.15/$0.60/M` off it. `▲ peak` or `▼ off-peak` marks a rate above or below pi's recorded rate. With stock peak-base prices, peak has no indicator and off-peak is marked as a discount. `/peak-hours status` names the schedule.
 
 The footer describes the current hour, not a particular request: a request invoked before a boundary uses its invocation timestamp even after the footer moves to the new hour. Request-specific corrections can also differ from the quoted catalog rate. Stale base prices remain stale; this extension applies a multiplier, not a price lookup. All costs are estimates, not invoices: server arrival times and Chinese public holidays are not modeled.
 
@@ -102,11 +102,11 @@ Note that a coding plan is billed in credits against a subscription, so pi's cos
 
 OpenRouter publishes the same windows machine-readably for models it hosts (`pricing.overrides` with `utc_days` / `utc_start` / `utc_end` on `https://openrouter.ai/api/v1/models`), but this extension reads its schedule from config rather than the network: the correction is a rate difference, not a price lookup, and a fetch would add a failure mode to a handler that must never throw.
 
-A malformed field falls back to its default rather than disabling the extension; a malformed file warns and resolves to defaults.
+A malformed field falls back to its default rather than disabling the extension; a malformed file warns and resolves to defaults. `/peak-hours on|off` refuses to rewrite a malformed, unreadable, or non-object config and reports that the save failed, leaving the existing file untouched.
 
 ## Design notes
 
-- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer shows no rate for uncovered models. A rate above the recorded one reads `peak`, below it `off-peak`. The `est.` label applies even with request-wide coverage.
+- **Only the selected model drives the indicator.** Schedules are provider- and model-scoped, so the footer shows no rate for uncovered models. A rate above the recorded one reads `peak`, below it `off-peak`.
 - **The footer follows the window it quotes.** pi has no render tick and fires no event while a session is idle, and a rate that changes at 04:00 would otherwise stay on screen until the next turn. The extension arms a single timer for the next instant the quoted rate changes and re-arms it after each fire, from the same clock reading as the status it is keeping fresh. It arms nothing when there is no status on screen, and the timer is unreferenced and cleared on session shutdown, so it neither holds pi open nor outlives its session.
 - **Rate by provider invocation.** Pi providers timestamp each assistant message before preparing and sending its HTTP request. That timestamp selects the multiplier, not completion time or the shared payload hook. With the companion, active state and schedules are captured at request dispatch; without it, foreground fallback uses the configuration at `message_end`.
 - **Scaled once.** Global weak identity guards protect usage and foreground message objects across loaded copies, retries, and returned replacements. Usage observed at dispatch remains handled even when its decision is unchanged (×1 or inactive), so fallback cannot overwrite it after a config change.
