@@ -8,6 +8,7 @@ type ModelKey = Pick<TargetModel, "provider" | "id">;
 
 export interface UsageLease {
 	provider: string;
+	api: TargetModel["api"];
 	isInstalled(): boolean;
 	remove(): void;
 }
@@ -43,6 +44,10 @@ interface PricingRules {
 	covers(model: ModelKey): boolean;
 	/** Called at dispatch; return a timestamp selector with no mutable config. */
 	snapshot(model: ModelKey): (timestamp: number) => number;
+}
+
+function leaseKey(target: Pick<TargetModel, "provider" | "api">): string {
+	return JSON.stringify([target.provider, target.api]);
 }
 
 /** Usage-only client of the companion's safe shared provider dispatcher. */
@@ -84,19 +89,20 @@ export function requestPricing(pi: ExtensionAPI, rules: PricingRules, onRetire: 
 		current.context = context;
 		const revision = ++current.revision;
 		const live = () => owner === current && current.revision === revision;
-		for (const [provider, lease] of leases) {
-			if (!lease.isInstalled()) { lease.remove(); leases.delete(provider); }
+		for (const [key, lease] of leases) {
+			if (!lease.isInstalled()) { lease.remove(); leases.delete(key); }
 		}
 		const tryModel = (candidate: TargetModel) => {
-			if (!live() || !rules.covers(candidate) || leases.has(candidate.provider)) return;
+			if (!live() || !rules.covers(candidate) || leases.has(leaseKey(candidate))) return;
 			const request: UsageRequest = {
 				context: current.context,
 				model: candidate,
 				priceFor,
 				respond(lease) {
 					if (!lease) return;
-					if (!live() || leases.has(lease.provider) || !lease.isInstalled()) { lease.remove(); return; }
-					leases.set(lease.provider, lease);
+					const key = leaseKey(lease);
+					if (!live() || leases.has(key) || !lease.isInstalled()) { lease.remove(); return; }
+					leases.set(key, lease);
 				},
 			};
 			pi.events.emit(OBSERVE_USAGE, request);
@@ -112,8 +118,8 @@ export function requestPricing(pi: ExtensionAPI, rules: PricingRules, onRetire: 
 			const available = await context.modelRegistry.getAvailable();
 			if (!live()) return;
 			current.available = available;
-			// A provider can serve several APIs. If one candidate cannot be leased,
-			// try the next; a successful lease covers that provider's actual requests.
+			// A lease covers only its provider/API pair. Keep trying other APIs
+			// even after one succeeds, and other candidates when a lease fails.
 			for (const candidate of available) tryModel(candidate);
 		} catch { /* Optional discovery failure leaves foreground fallback usable. */ }
 		// Keep acquired leases until retirement, even after schedule removal, so

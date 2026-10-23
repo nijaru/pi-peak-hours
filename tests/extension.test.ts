@@ -514,6 +514,7 @@ function companion(h: ReturnType<typeof harness>, accept = (_request: UsageReque
 		leases.push(state);
 		request.respond({
 			provider: request.model.provider,
+			api: request.model.api,
 			isInstalled: () => state.installed && !state.removed,
 			remove: () => { state.removed = true; },
 		});
@@ -577,6 +578,31 @@ describe("request-wide pricing client", () => {
 		expect(server.leases).toHaveLength(2);
 	});
 
+	test("leases two APIs on one provider and retires each independently", async () => {
+		const path = configPath();
+		write(path, SURCHARGE);
+		const completions = { ...DEEPSEEK_MODELS["deepseek-flash"], api: "openai-completions" };
+		const responses = { ...completions, id: "responses-model", api: "openai-responses" };
+		const h = harness(path, { available: [completions, responses] });
+		h.select(completions);
+		const server = companion(h);
+		await h.emit("session_start");
+		expect(server.leases.map((lease) => lease.request.model.api)).toEqual([completions.api, responses.api]);
+		const [first, second] = server.leases;
+		first!.installed = false;
+		await h.emit("before_agent_start");
+		expect(first!.removed).toBe(true);
+		expect(second!.removed).toBe(false);
+		expect(server.leases.map((lease) => lease.request.model.api)).toEqual([completions.api, responses.api, completions.api]);
+		second!.installed = false;
+		await h.emit("before_agent_start");
+		expect(second!.removed).toBe(true);
+		expect(server.leases[2]!.removed).toBe(false);
+		expect(server.leases.map((lease) => lease.request.model.api)).toEqual([completions.api, responses.api, completions.api, responses.api]);
+		await h.emit("session_shutdown");
+		expect(server.leases.every((lease) => lease.removed)).toBe(true);
+	});
+
 	test("covers available custom schedules plus current, tries candidate APIs, and prices the actual target", async () => {
 		const path = configPath();
 		write(path, { schedules: [
@@ -585,13 +611,13 @@ describe("request-wide pricing client", () => {
 			{ providers: ["deepseek"], outside: 0.5 },
 		] });
 		const model = (id: string, api: string) => ({ ...DEEPSEEK_MODELS["deepseek-flash"], provider: "fixture", id, api });
-		const rejected = model("cheap", "unsupported");
+		const rejected = model("unavailable", "unsupported");
 		const accepted = model("expensive", "openai-completions");
-		const h = harness(path, { available: [rejected, accepted, model("third", "openai-completions"), ASTRA] });
+		const h = harness(path, { available: [rejected, accepted, model("cheap", "openai-completions"), ASTRA] });
 		h.select(DEEPSEEK); // included even if not in getAvailable()
 		const server = companion(h, (request) => request.model.api !== "unsupported");
 		await h.emit("session_start");
-		expect(server.requests.map((request) => request.model.id)).toEqual([DEEPSEEK.id, "cheap", "expensive"]);
+		expect(server.requests.map((request) => request.model.id)).toEqual([DEEPSEEK.id, "unavailable", "expensive"]);
 		expect(server.requests.at(-1)?.model).toBe(accepted); // full model, not a reconstructed key
 		const fixture = server.leases.find((lease) => lease.request.model.provider === "fixture")!;
 		for (const [id, factor] of [["cheap", 0.5], ["expensive", 2]] as const) {
