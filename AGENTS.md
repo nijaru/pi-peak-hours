@@ -22,7 +22,7 @@ No build step — pi loads the extension directly.
 - A message is scaled at most once, including the replacement returned to pi; retries re-deliver the same object.
 - The footer quotes the rate in force (input/output per million tokens) and names the direction: `▲ peak` above the recorded rate, `▼ off-peak` below it.
 - The footer follows the window it quotes. pi emits nothing while a session is idle, so a timer armed for the next instant the quoted rate changes re-renders it. It is armed only while a status is actually on screen, from the same clock reading as that status, and cleared in `session_shutdown`.
-- Only the four cost fields change and `total` is recomputed from them. Token counts are never modified.
+- Scale the four catalog cost fields and recompute estimated totals. Preserve provider-billed `total` values (`totalFromProvider: true`), including zero. Token counts are never modified.
 - A malformed field keeps its default, including `active`; a malformed file warns and resolves to defaults. The extension never throws inside a message handler.
 
 ## Integration discipline

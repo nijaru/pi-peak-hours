@@ -36,7 +36,7 @@ export function applyMultiplier(cost: Usage["cost"], multiplier: number): Usage[
 		cacheRead: cost.cacheRead * multiplier,
 		cacheWrite: cost.cacheWrite * multiplier,
 	};
-	scaled.total = scaled.input + scaled.output + scaled.cacheRead + scaled.cacheWrite;
+	if (cost.totalFromProvider !== true) scaled.total = scaled.input + scaled.output + scaled.cacheRead + scaled.cacheWrite;
 	return scaled;
 }
 

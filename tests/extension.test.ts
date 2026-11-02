@@ -287,6 +287,25 @@ function captureTimers() {
 }
 
 describe("peak hours handlers", () => {
+	test.each(["foreground", "request"] as const)("preserves provider-billed totals through %s pricing", async (mode) => {
+		const path = configPath();
+		write(path, { ...SURCHARGE, providers: ["openrouter"] });
+		const h = harness(path);
+		h.select({ ...DEEPSEEK, provider: "openrouter" });
+		const server = mode === "request" ? companion(h) : undefined;
+		await h.emit("session_start");
+		for (const total of [0, 0.123]) {
+			const message = assistantMessage({ provider: "openrouter", usage: {
+				cost: { input: 0.15, output: 0.6, cacheRead: 0, cacheWrite: 0, total, totalFromProvider: true },
+			} });
+			await h.emit("message_start", { message });
+			server?.leases[0]!.request.priceFor({ provider: message.provider, id: message.model })(message.timestamp, message.usage);
+			const replacement = await h.emit<{ message: AssistantMessage }>("message_end", { message });
+			expect((replacement?.message ?? message).usage.cost).toEqual({
+				input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0, total, totalFromProvider: true,
+			});
+		}
+	});
 	test("scales the finalized message and quotes the rate it used", async () => {
 		const path = configPath();
 		write(path, SURCHARGE);

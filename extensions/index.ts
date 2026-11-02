@@ -4,7 +4,7 @@
  * DeepSeek is the clearest example: a 2x multiplier applies during peak windows
  * (01:00-04:00 and 06:00-10:00 UTC, Monday-Friday, as of September 2026) and the
  * off-peak rate is half of it. pi has no notion of time-of-day pricing —
- * `usage.cost` is computed once from the model's flat rates when usage is
+ * `usage.cost` component estimates use the model's flat rates when usage is
  * finalized — so a session is over- or understated by up to 2x, in whichever
  * direction the recorded rate sits from the billed one.
  *
@@ -46,15 +46,15 @@
  *   instead of correcting it.
  * - A message is never scaled twice. Retries and overflow recovery can deliver
  *   the same message object again, so adjustments are guarded by identity.
- * - Only the four cost fields are touched, and `total` is recomputed from
- *   them, preserving pi's own invariant. Token counts are real and never
+ * - Scale catalog cost fields and recompute estimated totals; preserve
+ *   provider-reported billed totals, including zero. Token counts are never
  *   modified, so any rate derived from cost/tokens stays self-consistent
  *   (cache-miss accounting derives paid and read rates from the same message
  *   and scales with it).
  * - Unknown or malformed configuration falls back to the defaults with a
  *   warning; no path throws from a message handler.
  *
- * All costs remain estimates, not invoices: server arrival, Chinese public
+ * Scheduled rates remain estimates, not invoices: server arrival, Chinese public
  * holidays, and usage outside observed provider requests are not modeled.
  */
 
